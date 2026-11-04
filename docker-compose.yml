@@ -1,0 +1,75 @@
+services:
+  subtitle-forge:
+    build: .
+    image: ghcr.io/lzxssg/subtitle-forge:1.0.0
+    # 使用预构建镜像时：注释掉上面的 build，镜像改为
+    # image: ghcr.io/lzxssg/subtitle-forge:latest
+    container_name: subtitle-forge
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8310}:8310"
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - WEB_PORT=8310
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - MODE=${MODE:-manual}
+      - QUEUE_PAUSED=${QUEUE_PAUSED:-false}
+      - WATCH_DIRS=${WATCH_DIRS:-/Media}
+      - SCAN_INTERVAL_MINUTES=${SCAN_INTERVAL_MINUTES:-60}
+      - TASK_WORKERS=${TASK_WORKERS:-1}
+      - SMART_QUEUE=${SMART_QUEUE:-true}
+      - MULTI_MODEL_VRAM_MB=${MULTI_MODEL_VRAM_MB:-16000}
+      - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      - VIDEO_EXTS=${VIDEO_EXTS:-.mp4,.mkv,.avi,.mov,.wmv,.flv,.webm,.ts,.m2ts}
+      - ASR_PROVIDER=${ASR_PROVIDER:-local}
+      - ASR_MODEL=${ASR_MODEL:-small}
+      - ASR_DEVICE=${ASR_DEVICE:-auto}
+      - ASR_COMPUTE_TYPE=${ASR_COMPUTE_TYPE:-int8}
+      - ASR_LANGUAGE=${ASR_LANGUAGE:-auto}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_MODEL=${LLM_MODEL:-qwen2.5:7b}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.3}
+      - REVIEW_BASE_URL=${REVIEW_BASE_URL:-}
+      - REVIEW_API_KEY=${REVIEW_API_KEY:-}
+      - REVIEW_MODEL=${REVIEW_MODEL:-}
+      - POLISH_ENABLED=${POLISH_ENABLED:-false}
+      - POLISH_BASE_URL=${POLISH_BASE_URL:-}
+      - POLISH_API_KEY=${POLISH_API_KEY:-}
+      - POLISH_MODEL=${POLISH_MODEL:-}
+      - PHASE_MODE=${PHASE_MODE:-pipeline}
+      - SOURCE_LANG=${SOURCE_LANG:-auto}
+      - TARGET_LANG=${TARGET_LANG:-zh}
+      - SUBTITLE_SUFFIX=${SUBTITLE_SUFFIX:-.zh}
+      - TRANSLATE_ONLY=${TRANSLATE_ONLY:-false}
+      - SKIP_EXISTING_SUBTITLE=${SKIP_EXISTING_SUBTITLE:-true}
+      - TRANSCRIPT_QUALITY_THRESHOLD=${TRANSCRIPT_QUALITY_THRESHOLD:-60}
+      - TRANSLATION_QUALITY_THRESHOLD=${TRANSLATION_QUALITY_THRESHOLD:-70}
+      - LLAMA_SWAP_CONFIG=${LLAMA_SWAP_CONFIG:-/config-llama.yaml}
+      - LLAMA_MODELS_DIR=${LLAMA_MODELS_DIR:-/models-llama}
+      - LLAMA_SWAP_CONTAINER=${LLAMA_SWAP_CONTAINER:-llama-swap}
+    volumes:
+      # 媒体目录：按实际宿主路径修改，冒号右侧为容器内路径，需与 WATCH_DIRS 对应
+      - ${MEDIA_ROOT:-/path/to/media}:/Media:rw
+      # 需要监控多个目录时追加，例如：
+      # - /path/to/movies:/Movies:rw
+      # - /path/to/tv:/TV:rw
+      # 应用数据（配置 / 数据库 / 日志 / 模型缓存）
+      - ./config:/app/config:rw
+      - ./data:/app/data:rw
+      - ./models:/app/models:rw
+      - ./logs:/app/logs:rw
+      # 可选：容器内直接操作宿主机 docker（仅 ASR_PROVIDER=llama 时需要）
+      # - /var/run/docker.sock:/var/run/docker.sock:rw
+      # 可选：llama-swap 模型目录与配置（仅 ASR_PROVIDER=llama 时需要）
+      # - ${LLAMA_MODELS_HOST:-/path/to/llama-models}:/models-llama:rw
+      # - /path/to/llama-swap/config.yaml:/config-llama.yaml:rw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    gpus: all
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"

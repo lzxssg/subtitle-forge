@@ -1,0 +1,16 @@
+.git
+.github
+.gitignore
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+*.log
+data/
+logs/
+models/
+config/
+media/
+.env
+backups/
+*.zip
