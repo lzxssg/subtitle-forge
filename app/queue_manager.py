@@ -29,6 +29,7 @@ logger = logging.getLogger("subtitle-forge.queue")
 # 转录相关状态（staged 模式下 Sakura 需要让出显存）
 TRANSCRIBE_STATUSES = ("pending", "extracting", "transcribing", "checking")
 TRANSCRIBED = "transcribed"
+TRANSLATING = "translating"
 
 STAGE_WEIGHTS = {
     "extracting": (0.02, 0.06),       # 权重范围 (起始, 结束)
@@ -78,6 +79,7 @@ class SmartQueue:
         # staged 两阶段模式控制
         self._sakura_stopped = False      # 转录阶段已停 Sakura
         self._translation_started = False  # 翻译阶段已启动 Sakura 并提交 transcribed
+        self._translate_submitted = set()  # 已提交翻译的任务 id，防重复入队
         self._event_hooks = []  # (event_type, payload) 回调
         # 阶段并发门：转录 / 翻译 各自限流（auto=按 GPU 画像智能推荐，可在 Web 界面调整）
         # 注：初始化为 1，真实值在 start()→apply_limits()（数据库初始化后）解析
@@ -434,16 +436,31 @@ class SmartQueue:
         logger.warning("等待其他任务翻译空闲超时（%ss），仍尝试卸载 LLM", timeout)
 
     def _pre_transcribe_unload(self, task_id):
+        """转录前显存守护：按实际空闲显存决定是否卸载常驻 LLM，给 ASR 让位。
+
+        - 多模型模式：交给 llm_manager 按空闲显存自行判断。
+        - 单模型模式：即使 llama_swap_auto_unload 关闭，只要空闲显存不够当前
+          ASR 模型（型号+精度）加载，仍强制卸载，避免先 OOM 再自愈白等一轮。
+        """
         if self.is_parallel():
             return  # 多模型模式：由 llm_manager 按空闲显存决定是否卸载，不强制清空
-        """转录前显存守护：llama-swap 托管时卸载全部 LLM 模型给 ASR 让位。"""
-        if not config.get_setting("llama_swap_auto_unload", True):
-            logger.info("llama_swap_auto_unload 已关闭，跳过 LLM 卸载")
-            return
         if not self._managed_by_llamaswap():
             return
+        auto = bool(config.get_setting("llama_swap_auto_unload", True))
+        need = llm_manager.estimate_asr_vram_mb()
+        free = llm_manager.free_vram_mb()
+        forced = bool(free) and free < need
+        if not auto and not forced:
+            logger.info("llama_swap_auto_unload 已关闭，且空闲显存 %dMB ≥ ASR 需求 %dMB，跳过卸载",
+                        free, need)
+            return
+        if forced and not auto:
+            logger.warning("llama_swap_auto_unload 已关闭，但空闲显存 %dMB < ASR 需求 %dMB，"
+                           "强制卸载 LLM 让位（避免 ASR 加载 OOM）", free, need)
         self._wait_translation_idle(task_id)
         llm_manager.prepare_for("transcribe")
+        free = llm_manager.wait_vram_free(need)
+        logger.info("转录前显存守护：空闲 %dMB / ASR 需求 %dMB", free, need)
 
     def _start_sakura(self):
         """翻译阶段启动 LLM 容器并等待就绪。"""
@@ -488,21 +505,40 @@ class SmartQueue:
         """staged 模式阶段切换：
         - 转录阶段：存在待转录/转录中任务时，若 Sakura 在运行则停止以释放显存。
         - 翻译阶段：无转录任务且存在 transcribed 待翻译时，启动 Sakura 并提交翻译。
+        - 全部转录/翻译结束：复位阶段标志，使后续新增任务仍能重新触发翻译。
         """
         try:
             transcribing = db.count_by_status(TRANSCRIBE_STATUSES)
             waiting = db.count_by_status([TRANSCRIBED])
+            translating = db.count_by_status([TRANSLATING, "checking_translation", "polishing"])
             if transcribing > 0:
                 if not self._sakura_stopped and self._sakura_running():
                     if self._stop_sakura():
                         self._sakura_stopped = True
-            elif waiting > 0 and not self._translation_started:
-                if self._start_sakura():
-                    self._translation_started = True
+                # 新一轮转录开始：允许转录完成后再次触发翻译阶段
+                self._translation_started = False
+                self._translate_submitted.clear()
+            elif waiting > 0:
+                if not self._translation_started:
+                    if self._start_sakura():
+                        self._translation_started = True
+                if self._translation_started:
                     rows = db.list_tasks_by_status([TRANSCRIBED])
+                    queued = 0
                     for r in rows:
-                        self.submit(r["id"])
-                    logger.info("转录阶段完成，%d 条任务进入翻译阶段", len(rows))
+                        tid = r["id"]
+                        if tid in self._translate_submitted:
+                            continue
+                        self._translate_submitted.add(tid)
+                        self.submit(tid)
+                        queued += 1
+                    if queued:
+                        logger.info("转录阶段完成，%d 条任务进入翻译阶段（本轮提交 %d 条）",
+                                    len(rows), queued)
+            elif translating <= 0:
+                # 没有任何转录/翻译任务在跑：复位，等待下一批
+                self._translation_started = False
+                self._translate_submitted.clear()
         except Exception as e:
             logger.warning("staged checkpoint 异常: %s", e)
 
@@ -903,7 +939,7 @@ class SmartQueue:
         """流水线最后一步：把校对后的译文润色为地道中文，输出 .zh.rs.srt 与原翻译并存。"""
         if not segments:
             return
-        self._set_stage(task_id, "polishing", 96)
+        self._set_stage(task_id, "polishing", 98)
         self._enter_stage("polishing")
         self._enter_model_group("review")
         # 环节切换：卸载翻译/质检等非润色模型，让位给润色模型（llama-swap 懒加载目标模型）
@@ -1036,8 +1072,13 @@ class SmartQueue:
 
 
 def _overall(stage, inner_progress):
+    """阶段内进度换算为整体百分比（0~100，与前端进度条、_set_stage 基数同一尺度）。
+
+    STAGE_WEIGHTS 存的是比例（0.06/0.56 ...），此处统一乘 100 输出百分比；
+    否则转录/翻译期间整体进度只有 0.0x~0.5x，前端按 'xx%' 显示后几乎不动。
+    """
     lo, hi = STAGE_WEIGHTS[stage]
-    return round(lo + (hi - lo) * inner_progress / 100, 2)
+    return round((lo + (hi - lo) * inner_progress / 100) * 100, 2)
 
 
 def _file_exists(p):
