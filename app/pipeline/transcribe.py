@@ -164,14 +164,17 @@ def _load_with_fallback(model_name: str, device: str, compute_type: str, cpu_thr
                            dev, ct, f"{gpu[1]}/{gpu[0]}MB" if gpu else "未知", str(e)[:160])
             if dev != "cuda":
                 continue
-            # 首次 OOM：先尝试卸载 llama-swap 常驻 LLM，释放显存后用原参数重试
+            # 首次 OOM：先尝试卸载 llama-swap 常驻 LLM，等显存真正回落再用原参数重试
             if idx == 0:
                 try:
+                    need = llm_manager.estimate_asr_vram_mb() or 0
                     llm_manager.unload_all()
-                    logger.warning("已请求 llama-swap 卸载全部 LLM，3s 后重试 ASR 加载")
+                    free = llm_manager.wait_vram_free(need, timeout=15) if need else 0
+                    logger.warning("已请求 llama-swap 卸载全部 LLM，等待显存释放后重试 ASR 加载"
+                                   "（空闲 %dMB / 需求 %dMB）", free, need)
                 except Exception as ee:
                     logger.warning("卸载 LLM 失败: %s", ee)
-                time.sleep(3)
+                    time.sleep(3)
                 try:
                     model = _build_model(model_name, dev, ct, cpu_threads)
                     _last_effective.update({
