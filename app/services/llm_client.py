@@ -132,6 +132,52 @@ class LLMClient:
             "completion_tokens": usage.get("completion_tokens", 0),
         }
 
+    def warmup(self, timeout: float = 90.0) -> bool:
+        """阶段开始前把模型拉起来（llama-swap 懒加载），避免首个业务批次撞 502。
+
+        发一个 max_tokens=1 的极小请求，遇到 502/503/连接异常说明模型正在加载，
+        轮询等待直到就绪或超时。失败只告警，不阻断流程（业务请求仍有自身重试）。
+        """
+        if not self.ready:
+            return False
+        url = f"{self.base_url}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key and self.api_key.lower() not in ("", "ollama", "none"):
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 0,
+            "max_tokens": 1,
+            "stream": False,
+        }
+        if _need_disable_thinking(self.model):
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+        t0 = time.time()
+        deadline = t0 + timeout
+        probe = 0
+        while time.time() < deadline:
+            probe += 1
+            try:
+                resp = _session.post(url, headers=headers, json=payload, timeout=30)
+                if resp.status_code == 200:
+                    logger.info("LLM 模型 %s 预热完成（%.1fs / %d 次探测）",
+                                self.model, time.time() - t0, probe)
+                    return True
+                if resp.status_code not in (429, 500, 502, 503, 504):
+                    logger.warning("LLM 模型 %s 预热返回 %s，跳过预热",
+                                   self.model, resp.status_code)
+                    return False
+                logger.info("LLM 模型 %s 加载中（HTTP %s），稍后重探",
+                            self.model, resp.status_code)
+            except (requests.ConnectionError, requests.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                logger.info("LLM 预热连接异常：%s", str(e)[:80])
+            time.sleep(4)
+        logger.warning("LLM 模型 %s 预热超时（%.0fs），业务请求将自行重试",
+                       self.model, timeout)
+        return False
+
 
 def get_client() -> LLMClient:
     global _client
