@@ -2,9 +2,21 @@
 
 自动为影视文件生成中文字幕的全流程工具：语音转录 → 转录质检 → AI 翻译 → 翻译校对 → 大模型润色，最终输出自然地道的中文字幕（`.zh.srt` / `.zh.rs.srt`）。支持监控目录自动入队、Jellyfin/Emby 媒体入库联动、Web 端实时进度管理。
 
-**当前版本：v1.0.0** · [更新日志](CHANGELOG.md) · [发布指引](RELEASE.md)
+**当前版本：v1.0.1** · [更新日志](CHANGELOG.md) · [发布指引](RELEASE.md)
 
-## v1.0.0 更新功能
+## v1.0.1 更新功能
+
+| 类别 | 内容 |
+| --- | --- |
+| 同批次限流 | 新增 `BATCH_SIZE`（1–100，默认 20）：扫描/批量添加的任务先进「等候队列」，当前批次全部到达终态（含失败）后才放行下一批，流水线/并行/两阶段模式统一受限 |
+| 批次内环转 | 同一任务的下游环节（转录完成转入翻译等）视为同批次重投，不占用新名额，也不会被限流卡住 |
+| 放行去抖 | 批量扫描时先攒满等候队列再统一放行，避免逐个投递造成批次抖动 |
+| 队列视图 | 前端「全部排队」改为「等候队列」，当前批次成员与等候数量分开展示，不再被上千条任务刷屏 |
+| LLM 超时治理 | 新增 `LLM_TIMEOUT`（默认 180s）、`LLM_MAX_ATTEMPTS`（默认 3）、`LLM_TOTAL_BUDGET`（默认 360s），单次调用受总预算约束 |
+| 假死自愈 | 请求超时视为上游进程假死，首次超时即卸载该模型触发 llama-swap 重建，不再空等整条流水线 |
+| 配置校验 | 设置写接口改为白名单校验，`batch_size` 服务端夹紧到 1–100，脏值不再入库 |
+
+## v1.0.0 版本要点
 
 | 类别 | 内容 |
 | --- | --- |
@@ -143,6 +155,7 @@ docker compose up -d --build
 | `WATCH_DIRS` | `/Media` | 监控目录（容器内路径，逗号分隔） |
 | `SCAN_INTERVAL_MINUTES` | `60` | 自动扫描间隔 |
 | `TASK_WORKERS` | `1` | 任务线程数 |
+| `BATCH_SIZE` | `20` | 同批次任务数量上限（1–100），整批结束才放行下一批 |
 | `SMART_QUEUE` | `true` | 智能队列（去重 + 优先级 + 限流） |
 | `MULTI_MODEL_VRAM_MB` | `16000` | 多模型共存所需显存阈值 |
 | `HF_ENDPOINT` | `https://hf-mirror.com` | HuggingFace 镜像 |
@@ -154,6 +167,9 @@ docker compose up -d --build
 | `ASR_CPU_THREADS` | `8` | CPU 线程数 |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | 空 / 空 / `qwen2.5:7b` | 翻译模型 |
 | `LLM_TEMPERATURE` | `0.3` | 翻译采样温度 |
+| `LLM_TIMEOUT` | `180` | 单次 LLM 请求超时（秒） |
+| `LLM_MAX_ATTEMPTS` | `3` | 单次 LLM 调用重试次数 |
+| `LLM_TOTAL_BUDGET` | `360` | 单次 LLM 调用总时间预算（秒） |
 | `REVIEW_BASE_URL` / `REVIEW_API_KEY` / `REVIEW_MODEL` | 空 | 校对模型，留空回退翻译模型 |
 | `REVIEW_SAMPLE_COUNT` | `12` | 校对抽样条数 |
 | `POLISH_ENABLED` | `false` | 是否启用润色阶段 |

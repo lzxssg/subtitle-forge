@@ -5,19 +5,19 @@
 ```bash
 # 在仓库根目录
 git add -A
-git commit -m "release: v1.0.0"
-git tag -a v1.0.0 -m "v1.0.0"
+git commit -m "release: v1.0.1"
+git tag -a v1.0.1 -m "v1.0.1"
 git push origin main
-git push origin v1.0.0
+git push origin v1.0.1
 ```
 
-随后在 GitHub 仓库 → Releases → Draft a new release → 选择 `v1.0.0` 标签，附上 CHANGELOG 内容即可。
+随后在 GitHub 仓库 → Releases → Draft a new release → 选择 `v1.0.1` 标签，附上 CHANGELOG 内容即可。
 
 ## 二、发布容器镜像（ghcr.io）
 
 ### 方式 A：GitHub Actions 自动构建（推荐）
 
-仓库已内置工作流 `.github/workflows/docker-publish.yml`（`deploy/github-actions-docker-publish.yml` 为同内容模板，便于复制到其他仓库）：
+仓库已附带工作流模板 `deploy/github-actions-docker-publish.yml`（放在 `deploy/` 而非 `.github/workflows/`，避免推送时因 token 缺少 `workflow` scope 被拒）：
 
 1. 在 GitHub 网页上新建文件 `.github/workflows/docker-publish.yml`，内容直接粘贴 `deploy/github-actions-docker-publish.yml`；
    - 或用带 `workflow` scope 的 PAT 在本地执行：
@@ -27,8 +27,8 @@ git push origin v1.0.0
 
 ```
 ghcr.io/<owner>/<repo>:latest
-ghcr.io/<owner>/<repo>:1.0.0
-ghcr.io/<owner>/<repo>:1.0
+ghcr.io/<owner>/<repo>:1.0.1
+ghcr.io/<owner>/<repo>:2.3
 ghcr.io/<owner>/<repo>:<short-sha>
 ```
 
@@ -42,10 +42,10 @@ ghcr.io/<owner>/<repo>:<short-sha>
 echo "<PAT>" | docker login ghcr.io -u <github-user> --password-stdin
 
 # 2. 构建（需能访问 Docker Hub；国内可先配置镜像加速）
-docker build -t ghcr.io/<owner>/<repo>:1.0.0 -t ghcr.io/<owner>/<repo>:latest .
+docker build -t ghcr.io/<owner>/<repo>:1.0.1 -t ghcr.io/<owner>/<repo>:latest .
 
 # 3. 推送
-docker push ghcr.io/<owner>/<repo>:1.0.0
+docker push ghcr.io/<owner>/<repo>:1.0.1
 docker push ghcr.io/<owner>/<repo>:latest
 ```
 

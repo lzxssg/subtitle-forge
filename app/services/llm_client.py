@@ -99,18 +99,39 @@ class LLMClient:
             payload["chat_template_kwargs"] = {"enable_thinking": False}
         # v2.1.0: 502/连接异常兜底重试。低显存单模型切换时上游进程会重启，
         # 在途请求偶发 EOF/502，重试等待模型就绪后即可成功。
-        max_attempts = 6
-        last_err = None
-        for attempt in range(max_attempts):
+        # v2.3.0: 增加总时间预算，避免上游持续崩溃时单次调用把工作线程占住半小时以上。
+        def _int_setting(key, default, lo, hi):
             try:
-                resp = _session.post(url, headers=headers, json=payload, timeout=300)
+                return max(lo, min(hi, int(float(config.get_setting(key) or default))))
+            except (TypeError, ValueError):
+                return default
+
+        max_attempts = _int_setting("llm_max_attempts", 3, 1, 10)
+        attempt_timeout = _int_setting("llm_timeout", 180, 20, 1800)
+        total_budget = _int_setting("llm_total_budget", 360, 30, 7200)
+        deadline = time.time() + total_budget
+        last_err = None
+        resp = None
+        recovered = False
+        for attempt in range(max_attempts):
+            remain = deadline - time.time()
+            if remain <= 5:
+                break
+            try:
+                resp = _session.post(url, headers=headers, json=payload,
+                                     timeout=(10, min(attempt_timeout, remain)))
             except (requests.ConnectionError, requests.Timeout,
                     requests.exceptions.ChunkedEncodingError) as e:
                 last_err = e
                 logger.warning("LLM 请求连接异常（第%d/%d次）: %s",
                                attempt + 1, max_attempts, e)
+                # llama-swap 上游进程崩溃后可能进入假死：卸载模型强制其重建，避免整条流水线干等
+                if not recovered and isinstance(e, requests.Timeout):
+                    recovered = True
+                    self._recover_model(e)
                 if attempt < max_attempts - 1:
-                    time.sleep(3 + attempt * 4)
+                    pause = min(3 + attempt * 4, max(1, deadline - time.time() - 2))
+                    time.sleep(pause)
                     continue
                 raise RuntimeError(f"LLM 请求连接失败: {last_err}")
             if resp.status_code == 200:
@@ -120,9 +141,14 @@ class LLMClient:
                 logger.warning("LLM API %s（第%d/%d次），等待模型就绪后重试",
                                resp.status_code, attempt + 1, max_attempts)
                 if attempt < max_attempts - 1:
-                    time.sleep(3 + attempt * 4)
+                    pause = min(3 + attempt * 4, max(1, deadline - time.time() - 2))
+                    time.sleep(pause)
                     continue
             raise RuntimeError(f"LLM API 错误 {resp.status_code}: {resp.text[:300]}")
+        else:
+            resp = None
+        if resp is None or resp.status_code != 200:
+            raise RuntimeError(f"LLM 调用超时或失败（预算 {total_budget}s）: {last_err}")
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
         usage = data.get("usage", {}) or {}
@@ -131,6 +157,19 @@ class LLMClient:
             "prompt_tokens": usage.get("prompt_tokens", 0),
             "completion_tokens": usage.get("completion_tokens", 0),
         }
+
+    def _recover_model(self, err) -> None:
+        """请求超时（多为上游进程崩溃后假死）时尝试卸载模型，让 llama-swap 重新拉起。"""
+        try:
+            from . import llm_manager
+        except Exception:
+            return
+        try:
+            ok = llm_manager.unload_model(self.model)
+            logger.warning("LLM 请求超时（%s），已尝试卸载模型 %s 以触发重建：%s",
+                           type(err).__name__, self.model, ok)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("LLM 模型 %s 卸载失败（忽略）: %s", self.model, e)
 
     def warmup(self, timeout: float = 90.0) -> bool:
         """阶段开始前把模型拉起来（llama-swap 懒加载），避免首个业务批次撞 502。

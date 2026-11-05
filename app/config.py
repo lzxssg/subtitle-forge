@@ -40,6 +40,14 @@ DEFAULTS = {
     "source_lang": os.getenv("SOURCE_LANG", "auto"),
     "target_lang": os.getenv("TARGET_LANG", "zh"),
     "max_workers": int(os.getenv("MAX_WORKERS", "1")),
+    # v2.3.0: 同批次任务数量限制（1-100）。无论扫描/添加多少任务，一次只放行 N 个，
+    # 整批全部结束（含失败/取消）后才允许下一批 N 个进入，流水线/并行模式同样受限。
+    "batch_size": int(os.getenv("BATCH_SIZE", "20")),
+    # v2.3.0: LLM 单次调用超时、重试次数与总时间预算。上游模型崩溃时避免一个任务
+    # 长时间占住工作线程，导致整个队列看起来"卡死"。
+    "llm_timeout": int(os.getenv("LLM_TIMEOUT", "180")),
+    "llm_max_attempts": int(os.getenv("LLM_MAX_ATTEMPTS", "3")),
+    "llm_total_budget": int(os.getenv("LLM_TOTAL_BUDGET", "360")),
     # v4 新增：任务线程 / 转录并发 / 翻译并发（auto=按 GPU 画像智能推荐）
     "task_workers": int(os.getenv("TASK_WORKERS", os.getenv("MAX_WORKERS", "1"))),
     "transcribe_workers": os.getenv("TRANSCRIBE_WORKERS", "auto"),
@@ -114,7 +122,8 @@ EDITABLE_KEYS = [
     "asr_model", "asr_device", "asr_compute_type", "asr_cpu_threads", "asr_language", "asr_provider",
     "llm_base_url", "llm_api_key", "llm_model", "llm_temperature",
     "review_base_url", "review_api_key", "review_model",
-    "source_lang", "target_lang", "max_workers", "task_workers",
+    "source_lang", "target_lang", "max_workers", "task_workers", "batch_size",
+    "llm_timeout", "llm_max_attempts", "llm_total_budget",
     "transcribe_workers", "translate_workers", "polish_workers", "smart_queue", "translate_only",
     "polish_enabled",
     "skip_existing_subtitle", "subtitle_suffix",

@@ -1,7 +1,7 @@
 services:
   subtitle-forge:
     build: .
-    image: ghcr.io/lzxssg/subtitle-forge:1.0.0
+    image: ghcr.io/lzxssg/subtitle-forge:1.0.1
     # 使用预构建镜像时：注释掉上面的 build，镜像改为
     # image: ghcr.io/lzxssg/subtitle-forge:latest
     container_name: subtitle-forge

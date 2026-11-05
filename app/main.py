@@ -315,6 +315,7 @@ async def api_status():
         "monitor_enabled": bool(cfg.get("monitor_enabled", True)),
         "mode": cfg.get("mode", "manual"),
         "queue_paused": bool(cfg.get("queue_paused", False)),
+        "batch": smart_queue.batch_state(),
         "config": cfg,
     }
 
@@ -828,8 +829,15 @@ async def api_gpu_profile():
 @app.post("/api/config")
 async def api_set_config(body: ConfigBody):
     for k, v in body.values.items():
-        if k in config.EDITABLE_KEYS:
-            db.set_setting(k, v)
+        if k not in config.EDITABLE_KEYS:
+            continue
+        if k == "batch_size":
+            # 同批次任务数量限制：1-100
+            try:
+                v = max(1, min(100, int(float(v))))
+            except (TypeError, ValueError):
+                v = 20
+        db.set_setting(k, v)
     get_client().reload()
     # 若监控目录变更则重启 watcher
     if hasattr(app.state, "watcher"):

@@ -244,7 +244,7 @@ button.small.active { background: var(--accent); color: #fff; }
     <div class="logo">🎬</div>
     <div>
       <h1>SubtitleForge 智能字幕工厂</h1>
-      <small>v1.0.0 · by:lzxssg</small>
+      <small>v1.0.1 · by:lzxssg</small>
     </div>
   </div>
   <div class="top-right">
@@ -318,7 +318,7 @@ button.small.active { background: var(--accent); color: #fff; }
       <h3>任务队列 <span id="taskCount" style="font-size:12px;color:var(--muted)"></span> <button class="small" id="btnLoadMore" onclick="loadMoreTasks()" style="display:none;font-size:11px">加载更多</button></h3>
       <div class="btn-row">
         <div class="btn-group view">
-          <button class="small btn-view" id="queueViewAll" onclick="setQueueView('all')">全部排队</button>
+          <button class="small btn-view" id="queueViewAll" onclick="setQueueView('all')">等候队列</button>
           <button class="small btn-view" id="queueViewDone" onclick="setQueueView('done')">完成任务</button>
           <button class="small btn-view" id="queueViewFailed" onclick="setQueueView('failed')">失败任务</button>
           <button class="small btn-view" id="queueViewReview" onclick="setQueueView('review')">质检未过</button>
@@ -341,7 +341,8 @@ button.small.active { background: var(--accent); color: #fff; }
     <div class="q-stats" id="qStats">
       <div class="q-stat"><span class="q-stat-num" id="statTotal">0</span><span class="q-stat-label">总任务数</span></div>
       <div class="q-stat"><span class="q-stat-num" id="statActive">0</span><span class="q-stat-label">进行中</span></div>
-      <div class="q-stat"><span class="q-stat-num" id="statWaiting">0</span><span class="q-stat-label">排队中</span></div>
+      <div class="q-stat"><span class="q-stat-num" id="statWaiting">0</span><span class="q-stat-label">等候中</span></div>
+      <div class="q-stat"><span class="q-stat-num" id="statBatch">0/20</span><span class="q-stat-label">本批/上限</span></div>
       <div class="q-stat"><span class="q-stat-num" id="statDone">0</span><span class="q-stat-label">已完成</span></div>
       <div class="q-stat"><span class="q-stat-num" id="statFailed">0</span><span class="q-stat-label">失败</span></div>
       <button class="small" id="histToggle" style="margin-left:auto" onclick="toggleHistory()">最近记录 (0) ▸</button>
@@ -494,6 +495,7 @@ button.small.active { background: var(--accent); color: #fff; }
       </select><div class="form-hint">auto：显存充足时多模型环节并行；显存不足自动退化为单模型环节串行（同一时刻只驻留一个大模型，避免爆显存）。</div></div>
       <div class="form-row"><label>智能队列</label><select id="cfg_smart_queue"><option value="true">开启（去重+优先级+按GPU自动限流）</option><option value="false">关闭（仅按手动并发执行）</option></select><div class="form-hint">开启后：重复文件自动去重、字幕缺失优先、转录/翻译并发由系统按 GPU 型号与显存自动推荐（仍可在下方手动覆盖）。</div></div>
       <div class="form-row"><label>任务线程数</label><select id="cfg_task_workers"><option value="1">1（推荐，受显存约束）</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="6">6</option><option value="8">8</option></select><div class="form-hint">同时处理几个任务（受显存约束）。</div></div>
+      <div class="form-row"><label>同批次任务数量上限</label><input type="number" id="cfg_batch_size" min="1" max="100" step="1" value="20" style="width:110px"><div class="form-hint">1-100，默认 20。不论一键扫描出多少任务，只有当前这一批全部跑完（含失败）才会放行下一批；流水线/并行/两阶段模式都受此限制。</div></div>
       <div class="form-row"><label>转录并发（whisper）</label><select id="cfg_transcribe_workers"><option value="auto">智能自动（按 GPU 型号/显存推荐）</option><option value="1">1（显存紧张推荐）</option><option value="2">2（≥16G 显存）</option><option value="3">3（≥24G 显存）</option><option value="4">4（大显存专用）</option></select><div class="form-hint">同时进行语音转录的任务数，与翻译并发<b>独立</b>：whisper 与 sakura 共享显存，RTX 5060 8G 建议 1。</div></div>
       <div class="form-row"><label>翻译并发（大模型）</label><select id="cfg_translate_workers"><option value="auto">智能自动（按 GPU 型号/显存推荐）</option><option value="1">1（LLM 常驻显存，推荐）</option><option value="2">2（大显存/多卡）</option><option value="3">3（多卡专用）</option><option value="4">4（多卡专用）</option></select><div class="form-hint">同时调用翻译大模型的任务数，与转录并发<b>独立</b>：llama.cpp 单实例已满载 GPU，建议 1；并发只排队不加速。</div></div>
       <div class="form-row"><label>润色并发（大模型）</label><select id="cfg_polish_workers"><option value="auto">智能自动（按 GPU 型号/显存推荐）</option><option value="1">1（8G 显存推荐）</option><option value="2">2（≥12G 显存）</option><option value="3">3（≥24G 显存）</option><option value="4">4（大显存专用）</option></select><div class="form-hint" id="polishWorkersHint">同时润色几条字幕（LLM 推理，与翻译共享 GPU；需任务线程数 ≥ 并发数才生效）。</div></div>
@@ -604,6 +606,7 @@ async function loadStatus() {
   try {
     const r = await fetch('/api/status'); const s = await r.json();
     configData = s.config || {};
+    batchState = s.batch || null;
     $('monitorSwitch').checked = !!s.monitor_enabled;
     if (s.mode && $('modeSelect')) $('modeSelect').value = s.mode;
     const paused = !!s.queue_paused;
@@ -1116,6 +1119,17 @@ let historyOpen = false;
 const taskSel = new Set();
 function taskIsRunning(t) { return ['extracting','transcribing','checking','translating','checking_translation','polishing'].includes(t.status); }
 function taskIsTerminal(t) { return ['done','failed','cancelled','skipped'].includes(t.status); }
+// 当前批次上限与成员（来自 /api/status 的 batch 字段）
+let batchState = null;
+function batchSize() { return (batchState && Number(batchState.size)) || 20; }
+function batchMemberIds() {
+  return (batchState && Array.isArray(batchState.members) && batchState.members.length) ? new Set(batchState.members) : null;
+}
+// 各环节队列视图只展示当前批次内的任务，避免上千条等候任务刷屏
+function inBatchOnly(list) {
+  const ids = batchMemberIds();
+  return ids ? list.filter(t => ids.has(t.id)) : list;
+}
 function visibleTasks() {
   let vis;
   switch (queueView) {
@@ -1123,13 +1137,24 @@ function visibleTasks() {
     case 'done': vis = tasks.filter(t => t.status === 'done'); break;
     case 'failed': vis = tasks.filter(t => t.status === 'failed'); break;
     case 'review': vis = tasks.filter(t => (t.subtitles || []).some(s => s.status === 'needs_review')); break;
-    case 'transcribe': vis = tasks.filter(t => ['pending','extracting','transcribing'].includes(t.status)); break;
-    case 'check': vis = tasks.filter(t => ['checking','checking_translation'].includes(t.status)); break;
-    case 'translate': vis = tasks.filter(t => ['translating','transcribed'].includes(t.status)); break;
-    case 'polish': vis = tasks.filter(t => ['polishing'].includes(t.status)); break;
-    default: vis = tasks.filter(taskIsRunning);
+    case 'transcribe': vis = inBatchOnly(tasks.filter(t => ['pending','extracting','transcribing'].includes(t.status))); break;
+    case 'check': vis = inBatchOnly(tasks.filter(t => ['checking','checking_translation'].includes(t.status))); break;
+    case 'translate': vis = inBatchOnly(tasks.filter(t => ['translating','transcribed'].includes(t.status))); break;
+    case 'polish': vis = inBatchOnly(tasks.filter(t => ['polishing'].includes(t.status))); break;
+    default: {
+      // 当前队列：只显示本批次任务（数量=设置的同批次任务数量），运行中的排最上面
+      const ids = batchMemberIds();
+      let pool;
+      if (ids) {
+        pool = tasks.filter(t => ids.has(t.id));
+      } else {
+        pool = tasks.filter(t => taskIsRunning(t) || t.status === 'pending' || t.status === 'transcribed').slice(0, batchSize());
+      }
+      vis = pool.slice().sort((a, b) => (taskIsRunning(b) ? 1 : 0) - (taskIsRunning(a) ? 1 : 0)).slice(0, batchSize());
+      break;
+    }
   }
-  // 历史记录（最近记录折叠面板）仅在 当前任务 / 全部排队 视图下追加
+  // 历史记录（最近记录折叠面板）仅在 当前队列 / 等候队列 视图下追加
   if ((queueView === 'cur' || queueView === 'all') && historyOpen) {
     vis = vis.concat(tasks.filter(taskIsTerminal).filter(t => !vis.includes(t)));
   }
@@ -1241,9 +1266,14 @@ function renderTaskStats() {
   const failed = tasks.filter(t => t.status === 'failed').length;
   $('statTotal').textContent = totalCount;
   $('statActive').textContent = active;
-  $('statWaiting').textContent = waiting;
+  $('statWaiting').textContent = (batchState && typeof batchState.waiting === 'number') ? batchState.waiting : waiting;
   $('statDone').textContent = done;
   $('statFailed').textContent = failed;
+  const bEl = $('statBatch');
+  if (bEl) {
+    const used = (batchState && Array.isArray(batchState.members)) ? batchState.members.length : 0;
+    bEl.textContent = `${used}/${batchSize()}`;
+  }
 }
 // ---------- 进度平滑（按秒推进，避免"长时间不动→突然一大截"） ----------
 const smoothMap = {};
@@ -1527,6 +1557,7 @@ async function loadConfigForm() {
   $('cfg_asr_compute_type').value = c.asr_compute_type || 'int8';
   $('cfg_asr_language').value = c.asr_language || 'auto';
   $('cfg_task_workers').value = c.task_workers ?? c.max_workers ?? 1;
+  if ($('cfg_batch_size')) $('cfg_batch_size').value = c.batch_size ?? 20;
   $('cfg_transcribe_workers').value = c.transcribe_workers ?? 'auto';
   $('cfg_translate_workers').value = c.translate_workers ?? 1;
   $('cfg_auto_retry_failed').value = c.auto_retry_failed === false || c.auto_retry_failed === 'false' ? 'false' : 'true';
@@ -1582,6 +1613,7 @@ async function saveSettings() {
     asr_compute_type: v('cfg_asr_compute_type'),
     asr_language: v('cfg_asr_language'),
     task_workers: Number(v('cfg_task_workers')) || 1,
+    batch_size: Math.max(1, Math.min(100, Number(v('cfg_batch_size')) || 20)),
     transcribe_workers: v('cfg_transcribe_workers') || 'auto',
     translate_workers: v('cfg_translate_workers') || 'auto',
     polish_workers: v('cfg_polish_workers') || 'auto',

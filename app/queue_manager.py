@@ -76,6 +76,19 @@ class SmartQueue:
         self._workers = []
         self._stop = False
         self._running_tasks = set()
+        # v2.3.0 同批次任务数量限制：
+        #   _waiting       等候队列（尚未获准进入当前批次的任务 id，FIFO）
+        #   _batch_members 当前批次成员（已放行，含排队中/运行中/等待下一环节）
+        #   _in_flight     已投递到执行队列或正在执行的任务 id
+        self._batch_lock = threading.RLock()
+        self._waiting = []
+        self._waiting_set = set()
+        self._batch_members = []
+        self._in_flight = set()
+        self._batch_no = 0
+        self._requeue = set()        # 处理中再次 submit（同批次下一环节）的待重投任务
+        self._admit_lock = threading.Lock()
+        self._admit_timer = None     # 放行去抖：扫描批量入队时先攒满等候队列再放行
         # staged 两阶段模式控制
         self._sakura_stopped = False      # 转录阶段已停 Sakura
         self._translation_started = False  # 翻译阶段已启动 Sakura 并提交 transcribed
@@ -261,8 +274,153 @@ class SmartQueue:
         self._stop = True
         self._q.put(None)  # 唤醒
 
-    def submit(self, task_id: int):
+    # ---------- v2.3.0 同批次任务数量限制（批次闸门） ----------
+    BATCH_ACTIVE_STATUSES = ("pending", "extracting", "transcribing", "checking",
+                             "transcribed", "translating", "checking_translation", "polishing")
+    BATCH_END_STATUSES = ("done", "failed", "cancelled", "skipped", "paused")
+
+    def batch_size(self) -> int:
+        """同批次任务数量上限（1-100，默认 20）。"""
+        try:
+            n = int(float(db.get_setting("batch_size") or 20))
+        except (TypeError, ValueError):
+            n = 20
+        return max(1, min(100, n))
+
+    def batch_state(self) -> dict:
+        """当前批次状态快照（供前端渲染「当前队列 / 等候队列」）。"""
+        with self._batch_lock:
+            members = list(self._batch_members)
+            return {
+                "size": self.batch_size(),
+                "batch_no": self._batch_no,
+                "members": members,
+                # 真正被工作线程领走在跑的任务（前端置顶展示），已放行但还在等线程的不算
+                "running": [t for t in members if t in self._running_tasks],
+                "queued": [t for t in members if t not in self._running_tasks],
+                "waiting": len(self._waiting),
+            }
+
+    def _dispatch(self, task_id: int):
+        """把任务投递到执行队列（调用方需持有 _batch_lock）。"""
+        if task_id in self._in_flight:
+            return
+        self._in_flight.add(task_id)
         self._q.put(task_id)
+
+    def _admit_batch(self):
+        """当前批次全部结束后，按 batch_size 从等候队列放行下一批。
+
+        只有上一批成员全部处于终态（done/failed/cancelled/skipped/paused）时才放行，
+        上一批没跑完（含失败任务）绝不会提前进入下一批。
+        """
+        with self._batch_lock:
+            if self._batch_members:
+                return
+            size = self.batch_size()
+            admitted = []
+            while self._waiting and len(admitted) < size:
+                tid = self._waiting.pop(0)
+                self._waiting_set.discard(tid)
+                t = db.get_task(tid)
+                if not t or t["status"] not in self.BATCH_ACTIVE_STATUSES:
+                    continue  # 已结束/已删除/已暂停的任务直接跳过，不占批次名额
+                admitted.append(tid)
+            # 等候队列为空但仍有「已转录待翻译」的历史任务（如两阶段模式残留）时，
+            # 一并纳入本批，避免它们永远排不进批次
+            if not self._waiting and len(admitted) < size and self._phase_mode() == "staged":
+                for r in db.list_tasks_by_status([TRANSCRIBED]):
+                    if len(admitted) >= size:
+                        break
+                    tid = r["id"]
+                    if tid in self._batch_members or tid in self._waiting_set or tid in admitted:
+                        continue
+                    admitted.append(tid)
+            if not admitted:
+                return
+            self._batch_no += 1
+            self._batch_members = admitted
+            logger.info("第 %d 批放行 %d 个任务（批次上限 %d），等候队列剩余 %d",
+                        self._batch_no, len(admitted), size, len(self._waiting))
+            for tid in admitted:
+                self._dispatch(tid)
+            state = self.batch_state()
+        self._emit("batch_update", state)
+
+    def _on_task_finished(self, task_id: int):
+        """单个任务处理结束（含失败/取消）：释放批次名额，必要时放行下一批。"""
+        redispatch = False
+        with self._batch_lock:
+            self._in_flight.discard(task_id)
+            pending_next = task_id in self._requeue
+            self._requeue.discard(task_id)
+            t = db.get_task(task_id)
+            st = t["status"] if t else None
+            in_batch = task_id in self._batch_members
+            if in_batch and st in self.BATCH_ACTIVE_STATUSES and pending_next:
+                # 同一批次内进入下一环节（如 staged：转录→翻译），继续占本批名额
+                self._dispatch(task_id)
+                pending_next = False
+            elif in_batch and (st is None or st in self.BATCH_END_STATUSES):
+                self._batch_members.remove(task_id)
+            redispatch = pending_next
+        if redispatch:
+            # 不在批次内但处理中又提交过：重新走批次闸门排队
+            self.submit(task_id)
+        self._admit_batch()
+
+    def _schedule_admit(self, delay: float = 0.8):
+        """放行去抖：一键扫描会连续 submit 上百条，攒一小会儿再按 batch_size 放行，
+        避免「第一条任务刚入队就立刻放行、导致整批只跑 1 个」。
+        """
+        with self._admit_lock:
+            if self._admit_timer is not None and self._admit_timer.is_alive():
+                return
+            timer = threading.Timer(delay, self._admit_batch)
+            timer.daemon = True
+            self._admit_timer = timer
+            timer.start()
+
+    def _sweep_batch(self):
+        """清理批次中已结束/已暂停/已删除的成员（覆盖排队中被取消、删除等情况）。"""
+        empty = False
+        with self._batch_lock:
+            if not self._batch_members:
+                return
+            alive = []
+            for tid in self._batch_members:
+                t = db.get_task(tid)
+                if not t or t["status"] in self.BATCH_END_STATUSES:
+                    self._in_flight.discard(tid)
+                    continue
+                alive.append(tid)
+            if len(alive) != len(self._batch_members):
+                self._batch_members = alive
+            empty = not alive
+        if empty:
+            self._admit_batch()
+
+    def submit(self, task_id: int):
+        """任务入队：先进等候队列，由批次闸门按 batch_size 决定何时真正执行。
+
+        - 已在当前批次内（例如 staged 模式转录完成、等待翻译阶段）→ 重新投递执行
+        - 否则进入等候队列，等当前批次全部结束后再放行
+        """
+        with self._batch_lock:
+            if task_id in self._batch_members:
+                if task_id in self._in_flight:
+                    # 正被工作线程处理（环节内部提交下一阶段）：等收尾时重新投递，避免同一任务被两条线程同时跑
+                    self._requeue.add(task_id)
+                else:
+                    t = db.get_task(task_id)
+                    if t and t["status"] in self.BATCH_ACTIVE_STATUSES:
+                        self._dispatch(task_id)
+                return
+            if task_id in self._waiting_set:
+                return
+            self._waiting.append(task_id)
+            self._waiting_set.add(task_id)
+        self._schedule_admit()
 
     def pause_all(self) -> int:
         """暂停队列：停止领取新任务，并把所有进行中的任务置为 paused。
@@ -283,6 +441,18 @@ class SmartQueue:
                     (time.time(), r["id"]))
                 n += 1
         self._emit("queue_paused", {"paused": True, "count": n})
+        # 等候队列里的任务同样已置为 paused，清空等候队列，恢复时统一重新入队
+        with self._batch_lock:
+            while True:
+                try:
+                    tid = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if tid is not None:
+                    self._in_flight.discard(tid)
+            self._waiting.clear()
+            self._waiting_set.clear()
+        self._sweep_batch()
         logger.info("队列已暂停，%d 个任务挂起", n)
         return n
 
@@ -300,12 +470,17 @@ class SmartQueue:
     def cancel_all(self) -> int:
         """取消所有任务：清空排队队列 + 标记所有活动任务为 cancelled。返回受影响数量。"""
         count = 0
-        while True:
-            try:
-                self._q.get_nowait()
-                count += 1
-            except queue.Empty:
-                break
+        with self._batch_lock:
+            while True:
+                try:
+                    tid = self._q.get_nowait()
+                    if tid is not None:
+                        self._in_flight.discard(tid)
+                    count += 1
+                except queue.Empty:
+                    break
+            self._waiting.clear()
+            self._waiting_set.clear()
         now = time.time()
         with db.db() as conn:
             rows = conn.execute(
@@ -318,10 +493,21 @@ class SmartQueue:
                 )
                 count += 1
         self._running_tasks.clear()
+        self._sweep_batch()
         return count
 
     def clear_all(self) -> int:
         """清空全部任务与字幕记录（仅删除记录，不影响已生成字幕文件）。返回删除任务数。"""
+        with self._batch_lock:
+            self._waiting.clear()
+            self._waiting_set.clear()
+            self._batch_members.clear()
+            self._in_flight.clear()
+            while True:
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
         with db.db() as conn:
             conn.execute("DELETE FROM subtitles")
             cur = conn.execute("DELETE FROM tasks")
@@ -339,6 +525,8 @@ class SmartQueue:
             try:
                 task_id = self._q.get(timeout=2)
             except queue.Empty:
+                # 空闲时清理批次中已取消/暂停/删除的成员，避免批次无法收尾
+                self._sweep_batch()
                 continue
             if task_id is None:
                 continue
@@ -358,6 +546,8 @@ class SmartQueue:
             finally:
                 self._running_tasks.discard(task_id)
                 self._clear_progress_state(task_id)
+                # 批次收尾：本任务结束（含失败）后释放名额；整批结束才放行下一批
+                self._on_task_finished(task_id)
 
     # ---------- staged 两阶段模式 ----------
     def _phase_mode(self):
@@ -501,16 +691,33 @@ class SmartQueue:
             logger.warning("启动 LLM 容器失败: %s", e)
             return False
 
+    def _batch_member_ids(self) -> set:
+        with self._batch_lock:
+            return set(self._batch_members)
+
+    def _batch_status_counts(self) -> dict:
+        """统计当前批次成员的状态分布（staged 阶段切换只看当前批次，不受等候队列影响）。"""
+        with self._batch_lock:
+            members = list(self._batch_members)
+        counts = {}
+        for tid in members:
+            t = db.get_task(tid)
+            if t:
+                counts[t["status"]] = counts.get(t["status"], 0) + 1
+        return counts
+
     def _staged_checkpoint(self):
-        """staged 模式阶段切换：
+        """staged 模式阶段切换（仅针对当前批次）：
         - 转录阶段：存在待转录/转录中任务时，若 Sakura 在运行则停止以释放显存。
         - 翻译阶段：无转录任务且存在 transcribed 待翻译时，启动 Sakura 并提交翻译。
-        - 全部转录/翻译结束：复位阶段标志，使后续新增任务仍能重新触发翻译。
+        - 全部转录/翻译结束：复位阶段标志，使后续批次仍能重新触发翻译。
         """
         try:
-            transcribing = db.count_by_status(TRANSCRIBE_STATUSES)
-            waiting = db.count_by_status([TRANSCRIBED])
-            translating = db.count_by_status([TRANSLATING, "checking_translation", "polishing"])
+            counts = self._batch_status_counts()
+            transcribing = sum(counts.get(s, 0) for s in TRANSCRIBE_STATUSES)
+            waiting = counts.get(TRANSCRIBED, 0)
+            translating = (counts.get(TRANSLATING, 0) + counts.get("checking_translation", 0)
+                           + counts.get("polishing", 0))
             if transcribing > 0:
                 if not self._sakura_stopped and self._sakura_running():
                     if self._stop_sakura():
@@ -523,7 +730,8 @@ class SmartQueue:
                     if self._start_sakura():
                         self._translation_started = True
                 if self._translation_started:
-                    rows = db.list_tasks_by_status([TRANSCRIBED])
+                    members = self._batch_member_ids()
+                    rows = [r for r in db.list_tasks_by_status([TRANSCRIBED]) if r["id"] in members]
                     queued = 0
                     for r in rows:
                         tid = r["id"]
