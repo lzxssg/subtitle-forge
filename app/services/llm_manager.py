@@ -6,6 +6,7 @@ llama-swap 原生 API（Ollama 兼容扩展，端口与 /v1 相同）：
 - 无 load API：请求模型时自动加载（懒加载），切换模型自动卸载旧模型。
 """
 import logging
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -217,6 +218,70 @@ def _estimate_vram(model: str) -> int:
     return 2048
 
 
+# ASR 模型显存基准（MB，CTranslate2 float16 近似）：用于转录前预判是否需要腾挪显存
+_ASR_VRAM_BASE = {
+    "large-v3-turbo": 1600,
+    "large-v2": 3100,
+    "large-v3": 3200,
+    "medium": 1500,
+    "small": 800,
+    "base": 450,
+    "tiny": 250,
+}
+# 精度系数（相对 float16）
+_COMPUTE_FACTOR = {
+    "float16": 1.0,
+    "int8_float16": 0.62,
+    "int8": 0.42,
+    "float32": 1.9,
+}
+# CUDA context、解码 KV/特征缓存等固定开销
+_ASR_OVERHEAD_MB = 700
+
+
+def estimate_asr_vram_mb() -> int:
+    """估算当前配置的 ASR 模型加载所需显存（MB，含 CUDA context 余量）。
+
+    无法探测显存时返回 0，调用方应按“无需腾挪”处理，避免误卸载。
+    """
+    name = str(config.get_setting("asr_model") or "small").lower()
+    compute = str(config.get_setting("asr_compute_type") or "float16").lower()
+    base = 0
+    for key in sorted(_ASR_VRAM_BASE, key=len, reverse=True):
+        if key in name:
+            base = _ASR_VRAM_BASE[key]
+            break
+    if not base:
+        return 0
+    return int(base * _COMPUTE_FACTOR.get(compute, 1.0)) + _ASR_OVERHEAD_MB
+
+
+def free_vram_mb() -> int:
+    """当前可用显存（MB）。探测失败或非 N 卡返回 0。"""
+    total = gpu_vram_total_mb()
+    if not total:
+        return 0
+    return max(0, total - gpu_vram_used_mb())
+
+
+def wait_vram_free(need_mb: int, timeout: int = 20) -> int:
+    """等待卸载后显存真正回落（llama-swap 卸载为异步），返回最终空闲显存 MB。
+
+    仅轮询等待，不重复卸载；超时后照常返回，由 ASR 加载侧的 OOM 兜底继续保命。
+    """
+    if not need_mb:
+        return free_vram_mb()
+    deadline = time.time() + timeout
+    free = free_vram_mb()
+    while time.time() < deadline and free < need_mb:
+        time.sleep(1.5)
+        free = free_vram_mb()
+    if free < need_mb:
+        logger.warning("等待显存释放超时（%ss）：空闲 %dMB / 需求 %dMB，继续尝试加载 ASR",
+                       timeout, free, need_mb)
+    return free
+
+
 def scheduler_mode() -> str:
     """single=严格单模型串行；multi=允许大模型共存。依据 N 卡显存总量智能判断。"""
     total = gpu_vram_total_mb()
@@ -294,8 +359,31 @@ def prepare_for(stage: str) -> dict:
     report = {"mode": mode, "stage": stage, "actions": [], "unloaded": [], "kept": []}
     logger.info("调度[%s] 模式=%s", stage, mode)
     if mode == "multi":
-        return _prepare_multi(stage, report)
-    return _prepare_single(stage, report)
+        result = _prepare_multi(stage, report)
+    else:
+        result = _prepare_single(stage, report)
+    if stage in ("translate", "polish"):
+        result["warmup"] = warmup_stage_model(stage)
+    return result
+
+
+def warmup_stage_model(stage: str, timeout: float = 90.0) -> bool:
+    """阶段开始前预热该阶段的目标 LLM，把 llama-swap 冷启动的 502 提前消化。
+
+    仅告警不抛错：预热失败时业务请求仍走自身 6 次重试兜底。
+    """
+    try:
+        from .llm_client import get_client, get_polish_client
+    except Exception:
+        return False
+    try:
+        client = get_polish_client() if stage == "polish" else get_client()
+        if not client.ready:
+            return False
+        return client.warmup(timeout=timeout)
+    except Exception as e:
+        logger.warning("阶段 %s 模型预热异常（忽略）: %s", stage, e)
+        return False
 
 
 def _unload_whisper():
