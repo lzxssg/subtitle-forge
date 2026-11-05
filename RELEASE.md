@@ -17,7 +17,7 @@ git push origin v1.0.0
 
 ### 方式 A：GitHub Actions 自动构建（推荐）
 
-仓库已附带工作流模板 `deploy/github-actions-docker-publish.yml`（放在 `deploy/` 而非 `.github/workflows/`，避免推送时因 token 缺少 `workflow` scope 被拒）：
+仓库已内置工作流 `.github/workflows/docker-publish.yml`（`deploy/github-actions-docker-publish.yml` 为同内容模板，便于复制到其他仓库）：
 
 1. 在 GitHub 网页上新建文件 `.github/workflows/docker-publish.yml`，内容直接粘贴 `deploy/github-actions-docker-publish.yml`；
    - 或用带 `workflow` scope 的 PAT 在本地执行：
@@ -28,7 +28,7 @@ git push origin v1.0.0
 ```
 ghcr.io/<owner>/<repo>:latest
 ghcr.io/<owner>/<repo>:1.0.0
-ghcr.io/<owner>/<repo>:2.3
+ghcr.io/<owner>/<repo>:1.0
 ghcr.io/<owner>/<repo>:<short-sha>
 ```
 
