@@ -1,6 +1,7 @@
 """SubtitleForge 主入口：FastAPI + 静态界面 + SSE 实时推送。"""
 import asyncio
 import json
+import re
 import logging
 import os
 import threading
@@ -565,6 +566,20 @@ async def api_clear_all():
     return {"ok": True, "deleted": n}
 
 
+_ASR_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/\-]{0,63}")
+
+
+def _safe_asr_name(name):
+    """校验 ASR 模型名：仅允许字母数字与 . _ - /，禁止 .. 与路径穿越。
+
+    合法示例：large-v3、medium、mobiuslabsgmbh/faster-whisper-large-v3-turbo。
+    """
+    name = str(name or "").strip()
+    if not name or ".." in name:
+        return ""
+    return name if _ASR_NAME_RE.fullmatch(name) else ""
+
+
 def _resolve_enhanced_retry(enhanced, model=""):
     """解析「增强转录」参数：是否启用、用哪个 ASR 模型、精度。
 
@@ -575,11 +590,11 @@ def _resolve_enhanced_retry(enhanced, model=""):
         return False, "", ""
     if not bool(config.get_setting("enhanced_transcribe_enabled", True)):
         return False, "", ""
-    name = str(model or "").strip()[:64]
+    name = _safe_asr_name(model)
     if not name:
-        name = str(config.get_setting("enhanced_asr_model") or "").strip()
+        name = _safe_asr_name(config.get_setting("enhanced_asr_model"))
     if not name:
-        name = str(config.get_setting("asr_model") or "").strip()
+        name = _safe_asr_name(config.get_setting("asr_model"))
     compute = str(config.get_setting("enhanced_asr_compute_type") or "").strip()
     return True, name, compute
 
@@ -673,6 +688,44 @@ async def api_delete_needs_review_subtitles():
     if deleted_records:
         _broadcast("task_update", {"bulk": "needs_review_deleted"})
     return {"ok": True, "deleted_files": deleted_files, "deleted_records": deleted_records}
+
+
+@app.post("/api/tasks/{task_id}/subtitles/delete")
+async def api_delete_task_subtitles(task_id: int):
+    """删除单个任务产出的字幕文件与记录（任务本身保留，可用于重新生成）。"""
+    t = db.get_task(task_id)
+    if not t:
+        return {"ok": False, "error": "任务不存在"}
+    busy = ("pending", "extracting", "transcribing", "checking", "translating",
+            "checking_translation", "polishing")
+    if t["status"] in busy:
+        return {"ok": False, "error": "任务正在执行，请先取消后再删除字幕"}
+    subs = (db.subtitles_map([task_id]) or {}).get(task_id, [])
+    paths = [s["srt_path"] for s in subs]
+    for s in subs:
+        db.delete_subtitle(s["id"])
+    # 兜底：本工具在视频同目录生成的中间/润色字幕
+    video = Path(t["video_path"])
+    paths += [str(video.with_suffix(".transcript.srt")), str(video.with_suffix(".zh.rs.srt"))]
+    deleted_files = 0
+    seen = set()
+    for p in paths:
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        try:
+            fp = Path(p)
+            if fp.is_file():
+                fp.unlink()
+                deleted_files += 1
+        except Exception as e:
+            logger.warning("删除字幕文件失败 %s: %s", p, e)
+    # 清除字幕相关 meta，避免增强重试时复用旧转录结果或残留质检提示
+    db.update_task_meta(task_id, transcript_score=None, transcript_lang=None,
+                        enhanced_note=None, enhanced_flow=None,
+                        polish_model=None, polish_tokens_per_sec=None)
+    _broadcast("task_update", {"id": task_id, "subtitles_deleted": deleted_files})
+    return {"ok": True, "deleted_files": deleted_files, "deleted_records": len(subs)}
 
 
 @app.get("/api/tasks")
@@ -803,8 +856,13 @@ async def api_retry(task_id: int, enhanced: bool = False, model: str = ""):
     t = db.get_task(task_id)
     if not t:
         return {"ok": False, "error": "任务不存在"}
-    if t["status"] in ("done", "pending", "extracting", "transcribing", "checking", "translating", "checking_translation"):
+    running = ("pending", "extracting", "transcribing", "checking", "translating",
+               "checking_translation", "polishing")
+    if t["status"] in running:
         return {"ok": False, "error": f"任务状态 {t['status']} 不可重试"}
+    # 已完成任务默认不重试，但允许「增强重试」：用更强模型重新转录并覆盖现有字幕
+    if t["status"] == "done" and not enhanced:
+        return {"ok": False, "error": "任务已完成，如需重新生成请使用增强重试"}
     use_enh, enh_model, enh_compute = _resolve_enhanced_retry(enhanced, model)
     db.update_task(task_id, status="pending", progress=0, error="")
     if use_enh:
@@ -882,8 +940,8 @@ async def api_set_config(body: ConfigBody):
         elif k == "enhanced_transcribe_enabled":
             v = str(v).strip().lower() in ("1", "true", "yes", "on")
         elif k == "enhanced_asr_model":
-            # 增强转录模型名：仅接受安全字符，空值忽略（保留原设置）
-            v = str(v).strip()[:64]
+            # 增强转录模型名：白名单字符 + 禁止 ..；非法值忽略（保留原设置）
+            v = _safe_asr_name(v)
             if not v:
                 continue
         elif k == "enhanced_asr_compute_type":

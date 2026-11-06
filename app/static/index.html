@@ -1235,6 +1235,10 @@ function taskCard(t) {
   const ops = [];
   if (['done','failed','cancelled'].includes(st)) ops.push(`<button class="small" onclick="retryTask(${t.id})">重试</button>`);
   if (st === 'failed') ops.push(`<button class="small" onclick="retryTask(${t.id}, true)" title="用设置里的增强转录模型（如 large-v3）重新转录该视频">增强重试</button>`);
+  if (st === 'done') {
+    ops.push(`<button class="small" onclick="retryTask(${t.id}, true)" title="用设置里的增强转录模型（如 large-v3）重新转录该视频，覆盖现有字幕">增强重试</button>`);
+    ops.push(`<button class="small danger" onclick="delTaskSubtitles(${t.id})" title="删除该任务生成的转录/译文/润色字幕文件，任务记录保留">删除字幕</button>`);
+  }
   if (['pending','extracting','transcribing','checking','transcribed','translating','checking_translation','polishing'].includes(st)) ops.push(`<button class="small" onclick="cancelTask(${t.id})">取消</button>`);
   if (st === 'paused') ops.push(`<button class="small" onclick="resumeTask(${t.id})">恢复</button>`);
   ops.push(`<button class="small danger" onclick="delTask(${t.id})">删除记录</button>`);
@@ -1413,6 +1417,17 @@ async function retryTask(id, enhanced = false) {
   if (!d.ok) toast(d.error);
   else if (d.enhanced) toast(`已用增强模型 ${d.model || '默认'} 重新转录`);
   loadTasks();
+}
+async function delTaskSubtitles(id) {
+  const t = tasks.find(x => x.id === id);
+  const subs = (t && t.subtitles) || [];
+  const names = subs.map(s => s.srt_path.split('/').pop()).join('\n');
+  if (!confirm(`删除该任务生成的字幕文件？\n${names ? names + '\n' : ''}删除后不可恢复，任务记录保留。`)) return;
+  const r = await fetch(`/api/tasks/${id}/subtitles/delete`, { method:'POST' });
+  const d = await r.json();
+  if (!d.ok) return toast(d.error || '删除失败');
+  toast(`已删除 ${d.deleted_files} 个字幕文件、${d.deleted_records} 条记录`);
+  loadTasks(); loadStats();
 }
 async function delTask(id) { if (!confirm('删除该任务记录？（不影响已生成字幕文件）')) return; await fetch(`/api/tasks/${id}`, { method:'DELETE' }); loadTasks(); loadStats(); }
 async function retryFailedAll(enhanced = false) {
