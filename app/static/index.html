@@ -165,6 +165,14 @@ button.small.active { background: var(--accent); color: #fff; }
 .task-detail .err { cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .task-detail .err.open { white-space: pre-wrap; overflow: visible; }
 #histList.collapsed { display: none; }
+.task-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 10px; }
+.task-search { flex: 1 1 260px; min-width: 200px; padding: 7px 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 13px; }
+.task-search:focus { outline: none; border-color: var(--accent); }
+.page-size-wrap { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.page-size-wrap select { padding: 5px 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; }
+.pager { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.pager span { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.pager button:disabled { opacity: .4; cursor: not-allowed; }
 
 /* ---------- 资源图 ---------- */
 .res-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
@@ -315,7 +323,7 @@ button.small.active { background: var(--accent); color: #fff; }
   <!-- 任务列表 -->
   <div class="section">
     <div class="section-title">
-      <h3>任务队列 <span id="taskCount" style="font-size:12px;color:var(--muted)"></span> <button class="small" id="btnLoadMore" onclick="loadMoreTasks()" style="display:none;font-size:11px">加载更多</button></h3>
+      <h3>任务队列 <span id="taskCount" style="font-size:12px;color:var(--muted)"></span></h3>
       <div class="btn-row">
         <div class="btn-group view">
           <button class="small btn-view" id="queueViewAll" onclick="setQueueView('all')">等候队列</button>
@@ -336,6 +344,22 @@ button.small.active { background: var(--accent); color: #fff; }
           <button class="small btn-func" onclick="clearFailedTasks()">清空失败</button>
           <button class="small btn-func solid" id="pauseBtn" onclick="toggleQueuePause()">暂停队列</button>
         </div>
+      </div>
+    </div>
+    <div class="task-toolbar">
+      <input id="taskSearch" class="task-search" type="search" placeholder="搜索全部任务：片名 / 路径关键词" oninput="onSearchInput()" autocomplete="off">
+      <span class="page-size-wrap">每页
+        <select id="taskPageSize" onchange="onPageSizeChange()">
+          <option value="10">10</option>
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select> 条
+      </span>
+      <div class="pager">
+        <button class="small" id="pagePrev" onclick="gotoPage(-1)">上一页</button>
+        <span id="pageInfo">第 1/1 页</span>
+        <button class="small" id="pageNext" onclick="gotoPage(1)">下一页</button>
       </div>
     </div>
     <div id="scanBanner" class="scan-banner" style="display:none"></div>
@@ -646,6 +670,8 @@ async function loadStatus() {
 async function loadStats() {
   try {
     const r = await fetch('/api/stats'); const d = await r.json();
+    statsData = d;
+    renderTaskStats();
     $('stTotal').textContent = d.total ?? '-';
     $('stTodayDone').textContent = d.today_done ?? '-';
     $('stDone').textContent = d.done ?? '-';
@@ -1116,24 +1142,60 @@ async function scanTranslateNow() {
 
 // ---------- 任务 ----------
 let tasks = [];
-let taskOffset = 0;
-const taskPageSize = 1000;
+let totalCount = 0;
+let statsData = null;
+let histTasks = [];
+let taskPage = 0;
+let taskPageSize = Math.min(100, Math.max(5, Number(localStorage.getItem('sf_task_page_size') || 20)));
+let taskQuery = '';
+let _searchTimer = null;
 async function loadTasks() {
   try {
-    taskOffset = 0;
-    const r = await fetch(`/api/tasks?limit=${taskPageSize}&offset=${taskOffset}`); const d = await r.json();
-    tasks = d.tasks || []; totalCount = d.total || tasks.length; renderTasks();
+    const q = taskQuery.trim();
+    const view = q ? 'all' : queueView;
+    const p = new URLSearchParams({ limit: String(taskPageSize), offset: String(taskPage * taskPageSize), view });
+    if (q) p.set('q', q);
+    const r = await fetch('/api/tasks?' + p.toString()); const d = await r.json();
+    tasks = d.tasks || [];
+    totalCount = Number.isFinite(d.total) ? d.total : tasks.length;
+    const maxPage = Math.max(1, Math.ceil(totalCount / taskPageSize));
+    if (taskPage > maxPage - 1) { taskPage = maxPage - 1; return loadTasks(); }
+    renderTasks();
+    if (historyOpen) loadHistory();
   } catch(e) {}
 }
-async function loadMoreTasks() {
+async function loadHistory() {
   try {
-    taskOffset = tasks.length;
-    const r = await fetch(`/api/tasks?limit=${taskPageSize}&offset=${taskOffset}`); const d = await r.json();
-    const more = d.tasks || [];
-    const seen = new Set(tasks.map(t => t.id));
-    tasks = tasks.concat(more.filter(t => !seen.has(t.id)));
-    totalCount = d.total || totalCount; renderTasks();
+    const r = await fetch('/api/tasks?view=history&limit=20&batch=0'); const d = await r.json();
+    histTasks = d.tasks || []; renderHistory();
   } catch(e) {}
+}
+function renderHistory() {
+  const el = $('histList'); if (!el) return;
+  el.innerHTML = histTasks.length ? histTasks.map(taskCard).join('') : '<div class="empty small">暂无历史记录</div>';
+  el.classList.toggle('collapsed', !historyOpen);
+  const t = $('histToggle');
+  if (t) t.textContent = `最近记录 (${histTasks.length}) ${historyOpen ? '▾' : '▸'}`;
+}
+function onSearchInput() {
+  const el = $('taskSearch');
+  const v = el ? el.value : '';
+  clearTimeout(_searchTimer);
+  _searchTimer = setTimeout(() => { taskQuery = v.trim(); taskPage = 0; loadTasks(); }, 250);
+}
+function onPageSizeChange() {
+  const sel = $('taskPageSize');
+  taskPageSize = Math.min(100, Math.max(5, Number(sel && sel.value) || 20));
+  localStorage.setItem('sf_task_page_size', String(taskPageSize));
+  taskPage = 0; loadTasks();
+}
+function gotoPage(delta) {
+  const maxPage = Math.max(1, Math.ceil(totalCount / taskPageSize));
+  const next = Math.min(maxPage - 1, Math.max(0, taskPage + delta));
+  if (next === taskPage) return;
+  taskPage = next; loadTasks();
+  const sec = document.querySelector('.section');
+  if (sec) sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 let historyOpen = false;
 const taskSel = new Set();
@@ -1150,35 +1212,9 @@ function inBatchOnly(list) {
   const ids = batchMemberIds();
   return ids ? list.filter(t => ids.has(t.id)) : list;
 }
+// 视图过滤、批次限定、搜索与分页均由后端完成，tasks 即当前页要展示的卡片
 function visibleTasks() {
-  let vis;
-  switch (queueView) {
-    case 'all': vis = tasks.filter(t => t.status === 'pending' || t.status === 'transcribed' || t.status === 'paused'); break;
-    case 'done': vis = tasks.filter(t => t.status === 'done'); break;
-    case 'failed': vis = tasks.filter(t => t.status === 'failed'); break;
-    case 'review': vis = tasks.filter(t => (t.subtitles || []).some(s => s.status === 'needs_review')); break;
-    case 'transcribe': vis = inBatchOnly(tasks.filter(t => ['pending','extracting','transcribing'].includes(t.status))); break;
-    case 'check': vis = inBatchOnly(tasks.filter(t => ['checking','checking_translation'].includes(t.status))); break;
-    case 'translate': vis = inBatchOnly(tasks.filter(t => ['translating','transcribed'].includes(t.status))); break;
-    case 'polish': vis = inBatchOnly(tasks.filter(t => ['polishing'].includes(t.status))); break;
-    default: {
-      // 当前队列：只显示本批次任务（数量=设置的同批次任务数量），运行中的排最上面
-      const ids = batchMemberIds();
-      let pool;
-      if (ids) {
-        pool = tasks.filter(t => ids.has(t.id));
-      } else {
-        pool = tasks.filter(t => taskIsRunning(t) || t.status === 'pending' || t.status === 'transcribed').slice(0, batchSize());
-      }
-      vis = pool.slice().sort((a, b) => (taskIsRunning(b) ? 1 : 0) - (taskIsRunning(a) ? 1 : 0)).slice(0, batchSize());
-      break;
-    }
-  }
-  // 历史记录（最近记录折叠面板）仅在 当前队列 / 等候队列 视图下追加
-  if ((queueView === 'cur' || queueView === 'all') && historyOpen) {
-    vis = vis.concat(tasks.filter(taskIsTerminal).filter(t => !vis.includes(t)));
-  }
-  return vis;
+  return tasks;
 }
 function fmtBytes(n) {
   if (!n || n <= 0) return '-';
@@ -1263,11 +1299,9 @@ function taskCard(t) {
   </div>`;
 }
 let queueView = 'cur';
-function setQueueView(v) { queueView = v; renderTasks(); }
+function setQueueView(v) { queueView = v; taskPage = 0; loadTasks(); }
 async function deleteNeedsReviewAll() {
-  const rv = tasks.filter(t => (t.subtitles || []).some(s => s.status === 'needs_review'));
-  if (!rv.length) return toast('当前没有质检未通过的字幕');
-  if (!confirm(`将删除 ${rv.length} 个任务的质检未通过字幕文件（.srt）及记录，删除后不可恢复。确认执行？`)) return;
+  if (!confirm('将删除全部质检未通过的字幕文件（.srt）及记录，删除后不可恢复。确认执行？')) return;
   const r = await fetch('/api/subtitles/needs-review/delete', { method:'POST' });
   const d = await r.json();
   toast(`已删除 ${d.deleted_files} 个字幕文件、${d.deleted_records} 条记录`);
@@ -1288,15 +1322,13 @@ function setPhaseMode(mode) {
     .catch(() => toast('保存失败'));
 }
 function renderTaskStats() {
-  const active = tasks.filter(taskIsRunning).length;
-  const waiting = tasks.filter(t => t.status === 'pending' || t.status === 'transcribed' || t.status === 'paused').length;
-  const done = tasks.filter(t => t.status === 'done').length;
-  const failed = tasks.filter(t => t.status === 'failed').length;
-  $('statTotal').textContent = totalCount;
-  $('statActive').textContent = active;
-  $('statWaiting').textContent = (batchState && typeof batchState.waiting === 'number') ? batchState.waiting : waiting;
-  $('statDone').textContent = done;
-  $('statFailed').textContent = failed;
+  // 统计来自后端全量统计（分页后当前页不能代表全库）
+  const s = statsData || {};
+  $('statTotal').textContent = (s.total != null) ? s.total : totalCount;
+  $('statActive').textContent = (s.running != null) ? s.running : (s.active || 0);
+  $('statWaiting').textContent = (batchState && typeof batchState.waiting === 'number') ? batchState.waiting : (s.waiting || 0);
+  $('statDone').textContent = s.done || 0;
+  $('statFailed').textContent = s.failed || 0;
   const bEl = $('statBatch');
   if (bEl) {
     const used = (batchState && Array.isArray(batchState.members)) ? batchState.members.length : 0;
@@ -1341,15 +1373,23 @@ function ensureSmooth() {
 }
 function renderTasks() {
   tasks.filter(t => !taskIsRunning(t)).forEach(t => { delete smoothMap[t.id]; });
-  const hist = tasks.filter(taskIsTerminal);
   const loaded = tasks.length;
-  $('taskCount').textContent = loaded ? (totalCount > loaded ? `已显示 ${loaded}/${totalCount} 条` : `共 ${totalCount} 条`) : '';
-  $('btnLoadMore').style.display = (loaded && totalCount > loaded) ? 'inline-block' : 'none';
+  const maxPage = Math.max(1, Math.ceil(totalCount / taskPageSize));
+  const pageNow = Math.min(taskPage + 1, maxPage);
+  const scope = taskQuery.trim() ? `搜索「${taskQuery.trim()}」` : '';
+  $('taskCount').textContent = totalCount ? `${scope}${scope ? ' · ' : ''}共 ${totalCount} 条 · 第 ${pageNow}/${maxPage} 页` : scope;
+  const prev = $('pagePrev'), next = $('pageNext'), info = $('pageInfo');
+  if (prev) prev.disabled = pageNow <= 1;
+  if (next) next.disabled = pageNow >= maxPage;
+  if (info) info.textContent = `第 ${pageNow}/${maxPage} 页`;
+  const selPage = $('taskPageSize');
+  if (selPage && String(taskPageSize) !== selPage.value) selPage.value = String(taskPageSize);
   renderTaskStats();
   const vis = visibleTasks();
   if (!tasks.length) {
-    $('curList').innerHTML = '<div class="empty">暂无任务。添加监控文件夹或点击「立即扫描」后，将自动生成字幕。</div>';
-    $('allList').innerHTML = '<div class="empty small">队列空闲，没有排队任务</div>';
+    const msg = taskQuery.trim() ? `没有匹配「${esc(taskQuery.trim())}」的任务` : '暂无任务。添加监控文件夹或点击「立即扫描」后，将自动生成字幕。';
+    $('curList').innerHTML = `<div class="empty">${msg}</div>`;
+    $('allList').innerHTML = '';
   } else if (vis.length) {
     $('curList').innerHTML = vis.map(taskCard).join('');
     $('allList').innerHTML = '';
@@ -1358,9 +1398,7 @@ function renderTasks() {
     $('curList').innerHTML = `<div class="empty small">${emptyText}</div>`;
     $('allList').innerHTML = '';
   }
-  $('histList').innerHTML = hist.length ? hist.map(taskCard).join('') : '';
-  $('histList').classList.toggle('collapsed', !historyOpen);
-  $('histToggle').textContent = `最近记录 (${hist.length}) ${historyOpen ? '▾' : '▸'}`;
+  renderHistory();
   ['queueViewCur','queueViewAll','queueViewDone','queueViewFailed','queueViewReview','queueViewTranscribe','queueViewCheck','queueViewTranslate','queueViewPolish'].forEach(id => {
     const b = $(id); if (b) b.classList.toggle('active', b.id === 'queueView' + queueView[0].toUpperCase() + queueView.slice(1));
   });
@@ -1368,17 +1406,17 @@ function renderTasks() {
   $('allList').style.display = 'none';
   const reviewBar = $('reviewOpsBar');
   if (reviewBar) {
-    const rv = tasks.filter(t => (t.subtitles || []).some(s => s.status === 'needs_review'));
+    const rvTotal = (statsData && statsData.review != null) ? statsData.review : (queueView === 'review' ? totalCount : 0);
     reviewBar.style.display = queueView === 'review' ? 'flex' : 'none';
     const cntEl = $('reviewOpsCount');
-    if (cntEl) cntEl.textContent = `共 ${rv.length} 个任务待处理`;
+    if (cntEl) cntEl.textContent = `共 ${rvTotal} 个任务待处理`;
   }
   const allChk = $('taskSelAll');
   if (allChk) { allChk.checked = vis.length > 0 && vis.every(t => taskSel.has(t.id)); }
   updateTaskSelCount();
   ensureSmooth();
 }
-function toggleHistory() { historyOpen = !historyOpen; renderTasks(); }
+function toggleHistory() { historyOpen = !historyOpen; renderHistory(); if (historyOpen) loadHistory(); }
 function updateTaskSelCount() { const el = $('taskSelCount'); if (el) el.textContent = `已选 ${taskSel.size} 项`; }
 function toggleTaskSel(id, on) { on ? taskSel.add(id) : taskSel.delete(id); renderTasks(); }
 function toggleTaskSelAll(cb) {

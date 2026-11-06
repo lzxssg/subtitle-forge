@@ -218,6 +218,57 @@ def count_tasks():
         return conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
 
 
+# 任务列表视图与状态的映射（服务端分页/搜索用）
+VIEW_STATUS_SQL = {
+    "all": "status IN ('pending','transcribed','paused')",
+    "cur": ("status IN ('pending','extracting','transcribing','checking','transcribed',"
+            "'translating','checking_translation','polishing','paused')"),
+    "done": "status = 'done'",
+    "failed": "status = 'failed'",
+    "review": "EXISTS (SELECT 1 FROM subtitles s WHERE s.task_id=tasks.id AND s.status='needs_review')",
+    "transcribe": "status IN ('pending','extracting','transcribing')",
+    "check": "status IN ('checking','checking_translation')",
+    "translate": "status IN ('translating','transcribed')",
+    "polish": "status = 'polishing'",
+    "history": "status IN ('done','failed','cancelled','skipped')",
+}
+
+BATCH_VIEWS = ("cur", "transcribe", "check", "translate", "polish")
+
+_RUNNING_ORDER = ("CASE WHEN status IN ('extracting','transcribing','checking','translating',"
+                  "'checking_translation','polishing') THEN 0 ELSE 1 END, id DESC")
+
+
+def query_tasks(view="all", q="", limit=50, offset=0, batch_ids=None):
+    """按视图/关键词分页查询任务，返回 (rows, total)。
+
+    q 非空时忽略视图，直接在全部任务中按片名/路径模糊匹配。
+    batch_ids 非空时，仅返回属于当前批次的任务（与前端批次视图语义一致）。
+    """
+    v = (view or "all").lower()
+    q = (q or "").strip()
+    where, params = [], []
+    if q:
+        like = f"%{q}%"
+        where.append("(video_name LIKE ? OR video_path LIKE ?)")
+        params += [like, like]
+    else:
+        cond = VIEW_STATUS_SQL.get(v)
+        if cond:
+            where.append(cond)
+    if not q and batch_ids and v in BATCH_VIEWS:
+        ids = [int(i) for i in batch_ids]
+        where.append("id IN (%s)" % ",".join("?" * len(ids)))
+        params += ids
+    clause = (" WHERE " + " AND ".join(where)) if where else ""
+    order = _RUNNING_ORDER if (v == "cur" and not q) else "id DESC"
+    sql = f"SELECT * FROM tasks{clause} ORDER BY {order} LIMIT ? OFFSET ?"
+    with db() as conn:
+        total = conn.execute(f"SELECT COUNT(*) FROM tasks{clause}", tuple(params)).fetchone()[0]
+        rows = conn.execute(sql, tuple(params + [int(limit), int(offset)])).fetchall()
+    return rows, total
+
+
 def count_by_status(statuses):
     """统计指定状态集合的任务数。"""
     if not statuses:
@@ -324,10 +375,12 @@ def task_stats():
             " SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,"
             " SUM(CASE WHEN status='done' AND (stage='skipped' OR error LIKE '%跳过%') THEN 1 ELSE 0 END) AS skipped,"
             " SUM(CASE WHEN status='failed' AND error LIKE '%不支持%' THEN 1 ELSE 0 END) AS unsupported,"
-            " SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS waiting"
+            " SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS waiting,"
+            " SUM(CASE WHEN status IN ('extracting','transcribing','checking','translating','checking_translation','polishing') THEN 1 ELSE 0 END) AS running,"
+            " SUM(CASE WHEN EXISTS (SELECT 1 FROM subtitles s WHERE s.task_id=tasks.id AND s.status='needs_review') THEN 1 ELSE 0 END) AS review"
             " FROM tasks", (day_start, day_start)).fetchone()
     keys = ("total", "today", "today_done", "active", "done",
-            "failed", "cancelled", "skipped", "unsupported", "waiting")
+            "failed", "cancelled", "skipped", "unsupported", "waiting", "running", "review")
     return {k: int(r[k] or 0) for k in keys}
 
 

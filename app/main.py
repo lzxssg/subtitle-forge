@@ -729,13 +729,26 @@ async def api_delete_task_subtitles(task_id: int):
 
 
 @app.get("/api/tasks")
-async def api_tasks(limit: int = 200, offset: int = 0):
-    if limit > 5000:
-        limit = 5000
-    rows = db.list_tasks(limit, offset)
+async def api_tasks(limit: int = 20, offset: int = 0, q: str = "", view: str = "all", batch: int = 1):
+    """任务列表：支持视图过滤、关键词搜索与服务端分页。
+
+    - view：all/cur/done/failed/review/transcribe/check/translate/polish/history
+    - q：片名/路径关键词，非空时忽略视图，在全部任务中搜索
+    - batch=1：当前队列与各环节队列仅返回本批次任务
+    """
+    limit = max(1, min(int(limit), 500))
+    offset = max(0, int(offset))
+    view = (view or "all").lower()
+    batch_ids = None
+    if batch and not (q or "").strip() and view in db.BATCH_VIEWS:
+        try:
+            batch_ids = smart_queue.batch_state().get("members") or None
+        except Exception:
+            batch_ids = None
+    rows, total = db.query_tasks(view=view, q=q, limit=limit, offset=offset, batch_ids=batch_ids)
     subs = db.subtitles_map([t["id"] for t in rows])
     return {"tasks": [_task_row(t, subs.get(t["id"], [])) for t in rows],
-            "total": db.count_tasks()}
+            "total": total, "limit": limit, "offset": offset}
 
 
 @app.post("/api/tasks")
