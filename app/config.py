@@ -104,6 +104,12 @@ DEFAULTS = {
     # 显卡参数：留空/0 时自动读取 nvidia-smi，可手动覆盖（容器内看不到 GPU 的场景）
     "gpu_model_override": os.getenv("GPU_MODEL_OVERRIDE", ""),
     "gpu_vram_mb_override": int(os.getenv("GPU_VRAM_MB_OVERRIDE", "0")),
+    # v2.4.0: 增强转录——失败任务重试时可改用更强的 ASR 模型（如 large-v3）重新转录，
+    # 不改变全局默认模型；只对用户点「增强重试」的那次任务生效。
+    "enhanced_transcribe_enabled": os.getenv("ENHANCED_TRANSCRIBE_ENABLED", "true").lower() == "true",
+    "enhanced_asr_model": os.getenv("ENHANCED_ASR_MODEL", "large-v3"),
+    # 留空 = 沿用 asr_compute_type
+    "enhanced_asr_compute_type": os.getenv("ENHANCED_ASR_COMPUTE_TYPE", ""),
     # v1.7.0: 播放媒体 webhook 联动（Jellyfin/Emby/Plex 入库通知）
     "webhook_enabled": os.getenv("WEBHOOK_ENABLED", "false").lower() == "true",
     "webhook_secret": os.getenv("WEBHOOK_SECRET", ""),
@@ -135,6 +141,7 @@ EDITABLE_KEYS = [
     "parallel_transcribe_workers", "parallel_translate_workers", "parallel_polish_workers",
     "review_failed_dir", "review_archive_enabled",
     "gpu_model_override", "gpu_vram_mb_override",
+    "enhanced_transcribe_enabled", "enhanced_asr_model", "enhanced_asr_compute_type",
     "webhook_enabled", "webhook_secret", "webhook_events", "webhook_media_types", "webhook_path_map",
 ]
 

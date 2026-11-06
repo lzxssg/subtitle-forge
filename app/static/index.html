@@ -244,7 +244,7 @@ button.small.active { background: var(--accent); color: #fff; }
     <div class="logo">🎬</div>
     <div>
       <h1>SubtitleForge 智能字幕工厂</h1>
-      <small>v1.0.1 · by:lzxssg</small>
+      <small>v1.1.1 · by:lzxssg</small>
     </div>
   </div>
   <div class="top-right">
@@ -331,7 +331,8 @@ button.small.active { background: var(--accent); color: #fff; }
         <div class="btn-group func">
           <button class="small btn-func" onclick="cancelAllTasks()">取消全部</button>
           <button class="small btn-func" onclick="clearAllTasks()">清空记录</button>
-          <button class="small btn-func" onclick="retryFailedAll()">重试失败</button>
+          <button class="small btn-func" onclick="retryFailedAll(false)">重试失败</button>
+          <button class="small btn-func" onclick="retryFailedAll(true)" title="忽略已有转录结果，用设置里的增强模型重新转录全部失败任务">增强重试失败</button>
           <button class="small btn-func" onclick="clearFailedTasks()">清空失败</button>
           <button class="small btn-func solid" id="pauseBtn" onclick="toggleQueuePause()">暂停队列</button>
         </div>
@@ -483,6 +484,25 @@ button.small.active { background: var(--accent); color: #fff; }
         <option value="en">英语</option>
         <option value="ko">韩语</option>
       </select></div>
+      <div class="form-row"><label>增强转录（失败重试）</label><select id="cfg_enhanced_transcribe_enabled">
+        <option value="true">开启（失败任务多出「增强重试」）</option>
+        <option value="false">关闭</option>
+      </select><div class="form-hint">开启后，队列里<b>失败</b>的任务会多一个「增强重试」按钮：忽略已有转录结果，改用下面指定的更强模型重新转录视频；只对本次重试生效，不改变全局默认 ASR 模型。</div></div>
+      <div class="form-row"><label>增强转录模型</label><select id="cfg_enhanced_asr_model">
+        <option value="large-v3">large-v3（推荐，日语/韩语精度最高）</option>
+        <option value="large-v2">large-v2</option>
+        <option value="medium">medium</option>
+        <option value="large-v3-turbo">large-v3-turbo（默认 turbo，仅换精度时用）</option>
+        <option value="small">small</option>
+        <option value="base">base</option>
+        <option value="tiny">tiny</option>
+      </select><div class="form-hint">比默认 turbo 更强但更慢、更吃显存（large-v3 float16 约 6.4G）；显存紧张时建议先切两阶段模式。llama 托管方式下需先在 llama-swap 中部署 whisper-large-v3。</div></div>
+      <div class="form-row"><label>增强转录精度</label><select id="cfg_enhanced_asr_compute_type">
+        <option value="">沿用全局精度</option>
+        <option value="float16">float16（GPU 最快，推荐）</option>
+        <option value="int8_float16">int8_float16（省显存）</option>
+        <option value="int8">int8</option>
+      </select><div class="form-hint">默认沿用「精度」设置；large-v3 + float16 在 8G 显存上需要先卸载常驻 LLM（两阶段模式）。</div></div>
     </div>
 
     <!-- 队列与字幕 -->
@@ -1184,6 +1204,8 @@ function taskCard(t) {
   const checked = taskSel.has(t.id) ? 'checked' : '';
   const duration = meta.duration ? ' · 时长 ' + fmtDuration(meta.duration) : '';
   const lang = meta.detected_lang ? ' · 语言 ' + esc(meta.detected_lang) : '';
+  // 增强转录：展示本任务实际使用的 ASR 模型，便于确认是否真的走了 large-v3
+  const asrTag = meta.asr_model ? ' · 模型 ' + esc(meta.asr_model) : '';
   const polishInfo = meta.polish_tokens_per_sec
     ? ' · 润色' + (meta.polish_model ? '[' + esc(meta.polish_model) + ']' : '') + ' ' + Math.round(meta.polish_tokens_per_sec) + ' tok/s'
     : (meta.polish_model ? ' · 润色[' + esc(meta.polish_model) + ']' : '');
@@ -1209,8 +1231,10 @@ function taskCard(t) {
   let detail = '';
   if (t.error) detail += `<div class="err" title="点击展开/收起错误详情" onclick="this.classList.toggle('open')">✗ ${esc(t.error)}</div>`;
   if (meta.device_advice) detail += `<div class="warn">💡 ${meta.device_advice.can_succeed ? '可成功' : '设备难以成功'} — ${esc(meta.device_advice.suggestion)}</div>`;
+  if (meta.enhanced_note) detail += `<div class="warn">⚑ 增强转录：${esc(meta.enhanced_note)}</div>`;
   const ops = [];
   if (['done','failed','cancelled'].includes(st)) ops.push(`<button class="small" onclick="retryTask(${t.id})">重试</button>`);
+  if (st === 'failed') ops.push(`<button class="small" onclick="retryTask(${t.id}, true)" title="用设置里的增强转录模型（如 large-v3）重新转录该视频">增强重试</button>`);
   if (['pending','extracting','transcribing','checking','transcribed','translating','checking_translation','polishing'].includes(st)) ops.push(`<button class="small" onclick="cancelTask(${t.id})">取消</button>`);
   if (st === 'paused') ops.push(`<button class="small" onclick="resumeTask(${t.id})">恢复</button>`);
   ops.push(`<button class="small danger" onclick="delTask(${t.id})">删除记录</button>`);
@@ -1227,7 +1251,7 @@ function taskCard(t) {
     </div>
     <div class="progress"><div style="width:${fmt(t.progress)}%"></div><span>${pctText}</span></div>
     ${(meta.mode !== 'polish' && meta.source !== 'scan_polish') ? '<div class="stage-labels"><span>提取</span><span>转录</span><span>质检</span><span>翻译</span><span>校对</span><span>润色</span></div>' : ''}
-    <div class="task-meta"><span>${fmtBytes(t.file_size)}</span><span>添加 ${fmtTime(t.created_at)}</span><span>进度 ${fmt(t.progress)}%</span><span>${STAGE_NAMES[st] || st}${duration}${lang}${polishInfo}</span></div>
+    <div class="task-meta"><span>${fmtBytes(t.file_size)}</span><span>添加 ${fmtTime(t.created_at)}</span><span>进度 ${fmt(t.progress)}%</span><span>${STAGE_NAMES[st] || st}${duration}${lang}${asrTag}${polishInfo}</span></div>
     ${subInfo ? `<div class="task-detail">${subInfo}</div>` : ''}
     ${repDetail ? `<div class="task-detail">${repDetail}</div>` : ''}
     ${detail ? `<div class="task-detail">${detail}</div>` : ''}
@@ -1383,11 +1407,20 @@ async function batchTask(action) {
 }
 async function cancelTask(id) { await fetch(`/api/tasks/${id}/cancel`, { method:'POST' }); loadTasks(); }
 async function resumeTask(id) { const r = await fetch(`/api/tasks/${id}/resume`, { method:'POST' }); const d = await r.json(); if (!d.ok) toast(d.error); loadTasks(); }
-async function retryTask(id) { const r = await fetch(`/api/tasks/${id}/retry`, { method:'POST' }); const d = await r.json(); if (!d.ok) toast(d.error); loadTasks(); }
+async function retryTask(id, enhanced = false) {
+  const url = `/api/tasks/${id}/retry` + (enhanced ? '?enhanced=true' : '');
+  const r = await fetch(url, { method:'POST' }); const d = await r.json();
+  if (!d.ok) toast(d.error);
+  else if (d.enhanced) toast(`已用增强模型 ${d.model || '默认'} 重新转录`);
+  loadTasks();
+}
 async function delTask(id) { if (!confirm('删除该任务记录？（不影响已生成字幕文件）')) return; await fetch(`/api/tasks/${id}`, { method:'DELETE' }); loadTasks(); loadStats(); }
-async function retryFailedAll() {
-  const r = await fetch('/api/tasks/retry-failed', { method:'POST' }); const d = await r.json();
-  toast(`已重新入队 ${d.retried ?? 0} 个失败任务`); loadTasks();
+async function retryFailedAll(enhanced = false) {
+  const url = '/api/tasks/retry-failed' + (enhanced ? '?enhanced=true' : '');
+  const r = await fetch(url, { method:'POST' }); const d = await r.json();
+  if (d.enhanced) toast(`已用增强模型 ${d.model || '默认'} 重新入队 ${d.retried ?? 0} 个失败任务`);
+  else toast(`已重新入队 ${d.retried ?? 0} 个失败任务`);
+  loadTasks();
 }
 
 // ---------- 设置 ----------
@@ -1556,6 +1589,9 @@ async function loadConfigForm() {
   $('cfg_asr_device').value = c.asr_device || 'auto';
   $('cfg_asr_compute_type').value = c.asr_compute_type || 'int8';
   $('cfg_asr_language').value = c.asr_language || 'auto';
+  $('cfg_enhanced_transcribe_enabled').value = (c.enhanced_transcribe_enabled === false || c.enhanced_transcribe_enabled === 'false') ? 'false' : 'true';
+  $('cfg_enhanced_asr_model').value = c.enhanced_asr_model || 'large-v3';
+  $('cfg_enhanced_asr_compute_type').value = c.enhanced_asr_compute_type || '';
   $('cfg_task_workers').value = c.task_workers ?? c.max_workers ?? 1;
   if ($('cfg_batch_size')) $('cfg_batch_size').value = c.batch_size ?? 20;
   $('cfg_transcribe_workers').value = c.transcribe_workers ?? 'auto';
@@ -1612,6 +1648,9 @@ async function saveSettings() {
     asr_device: v('cfg_asr_device'),
     asr_compute_type: v('cfg_asr_compute_type'),
     asr_language: v('cfg_asr_language'),
+    enhanced_transcribe_enabled: v('cfg_enhanced_transcribe_enabled') === 'true',
+    enhanced_asr_model: v('cfg_enhanced_asr_model') || 'large-v3',
+    enhanced_asr_compute_type: v('cfg_enhanced_asr_compute_type'),
     task_workers: Number(v('cfg_task_workers')) || 1,
     batch_size: Math.max(1, Math.min(100, Number(v('cfg_batch_size')) || 20)),
     transcribe_workers: v('cfg_transcribe_workers') || 'auto',

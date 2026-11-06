@@ -239,13 +239,15 @@ _COMPUTE_FACTOR = {
 _ASR_OVERHEAD_MB = 700
 
 
-def estimate_asr_vram_mb() -> int:
-    """估算当前配置的 ASR 模型加载所需显存（MB，含 CUDA context 余量）。
+def estimate_asr_vram_mb(model_name=None, compute_type=None) -> int:
+    """估算 ASR 模型加载所需显存（MB，含 CUDA context 余量）。
 
+    model_name / compute_type 为空时取全局设置；增强转录会显式传入覆盖模型，
+    以确保按真实模型（如 large-v3）腾挪显存，而不是按 turbo 估算后再 OOM。
     无法探测显存时返回 0，调用方应按“无需腾挪”处理，避免误卸载。
     """
-    name = str(config.get_setting("asr_model") or "small").lower()
-    compute = str(config.get_setting("asr_compute_type") or "float16").lower()
+    name = str(model_name or config.get_setting("asr_model") or "small").lower()
+    compute = str(compute_type or config.get_setting("asr_compute_type") or "float16").lower()
     base = 0
     for key in sorted(_ASR_VRAM_BASE, key=len, reverse=True):
         if key in name:

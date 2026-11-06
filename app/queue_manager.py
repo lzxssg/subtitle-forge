@@ -625,19 +625,59 @@ class SmartQueue:
             time.sleep(2)
         logger.warning("等待其他任务翻译空闲超时（%ss），仍尝试卸载 LLM", timeout)
 
-    def _pre_transcribe_unload(self, task_id):
+    @staticmethod
+    def _take_asr_override(task_id):
+        """取出并清除任务级「增强转录」模型覆盖（一次性生效）。
+
+        增强重试时 main.py 会把 asr_model_override / asr_compute_override 写入任务 meta；
+        这里在真正转录前取出并立刻清空，保证只影响本次重试，失败后再点普通重试会回到默认模型。
+        返回 (model_name, compute_type)，无覆盖时返回 (None, None)。
+        """
+        try:
+            meta = db.task_meta(task_id) or {}
+        except Exception:
+            return None, None
+        model = str(meta.get("asr_model_override") or "").strip()
+        compute = str(meta.get("asr_compute_override") or "").strip()
+        if not model and not compute:
+            return None, None
+        try:
+            # enhanced_flow 保留到任务结束：增强流程产出的字幕不再判失败，直接落视频原目录
+            db.update_task_meta(task_id, asr_model_override="", asr_compute_override="",
+                                force_retranscribe=False, enhanced_retry=False,
+                                enhanced_flow=True)
+        except Exception:
+            logger.warning("清除任务 %s 增强转录标记失败", task_id, exc_info=True)
+        logger.info("任务 %s 启用增强转录：模型 %s，精度 %s", task_id,
+                    model or "默认", compute or "默认")
+        return (model or None), (compute or None)
+
+    @staticmethod
+    def _is_enhanced_flow(task_id):
+        """本任务是否由「增强转录」发起。
+
+        增强流程的定位是「用更强模型抢救失败任务」：产出的字幕直接落视频原目录，
+        质检不通过也不再判失败、不归档到质检未通过目录。
+        """
+        try:
+            return bool(db.task_meta(task_id).get("enhanced_flow"))
+        except Exception:
+            return False
+
+    def _pre_transcribe_unload(self, task_id, model_name=None, compute_type=None):
         """转录前显存守护：按实际空闲显存决定是否卸载常驻 LLM，给 ASR 让位。
 
         - 多模型模式：交给 llm_manager 按空闲显存自行判断。
         - 单模型模式：即使 llama_swap_auto_unload 关闭，只要空闲显存不够当前
           ASR 模型（型号+精度）加载，仍强制卸载，避免先 OOM 再自愈白等一轮。
+        - model_name / compute_type：增强转录覆盖模型，显存按该模型真实需求估算。
         """
         if self.is_parallel():
             return  # 多模型模式：由 llm_manager 按空闲显存决定是否卸载，不强制清空
         if not self._managed_by_llamaswap():
             return
         auto = bool(config.get_setting("llama_swap_auto_unload", True))
-        need = llm_manager.estimate_asr_vram_mb()
+        need = llm_manager.estimate_asr_vram_mb(model_name, compute_type)
         free = llm_manager.free_vram_mb()
         forced = bool(free) and free < need
         if not auto and not forced:
@@ -783,10 +823,14 @@ class SmartQueue:
                           suggestion="检查监控目录与文件挂载")
                 return
 
+            # v2.4.0 增强转录：强制重新转录时，忽略「已存在目标字幕」与断点续跑
+            meta_now = db.task_meta(task_id)
+            force_retranscribe = bool(meta_now.get("force_retranscribe"))
+
             # 已有目标字幕 → 直接完成
             suffix = cfg["subtitle_suffix"]
             target_srt = _srt_path(video_path, suffix)
-            if cfg["skip_existing_subtitle"] and _file_exists(target_srt):
+            if (not force_retranscribe) and cfg["skip_existing_subtitle"] and _file_exists(target_srt):
                 db.update_task(task_id, status="done", stage="skipped", progress=100,
                                error="已存在目标字幕，跳过")
                 self._emit("task_done", {"id": task_id, "status": "done", "note": "skip_existing"})
@@ -804,7 +848,7 @@ class SmartQueue:
                 return
 
             # 断点续跑：暂停中断后恢复的任务，已有质检通过的转录字幕则跳过重复转录
-            if db.task_meta(task_id).get("transcript_score") is not None:
+            if (not force_retranscribe) and meta_now.get("transcript_score") is not None:
                 from pathlib import Path as _P2
                 tsrt = str(_P2(video_path).with_suffix(".transcript.srt"))
                 if _file_exists(tsrt):
@@ -841,12 +885,16 @@ class SmartQueue:
         self._set_stage(task_id, "transcribing", 6)
         self._enter_stage("transcribing")
         self._enter_model_group("asr")
+        # v2.4.0 增强转录：取出本任务的一次性模型覆盖（如 large-v3）
+        ov_model, ov_compute = self._take_asr_override(task_id)
         try:
-            self._pre_transcribe_unload(task_id)  # v1.5.0: 转录前卸载 LLM，让位 ASR
+            self._pre_transcribe_unload(task_id, ov_model, ov_compute)  # v1.5.0: 转录前卸载 LLM，让位 ASR
             result = transcribe.transcribe(
                 wav,
                 progress_cb=lambda p: self._emit_progress(task_id, _overall("transcribing", p)),
                 cancel_check=lambda: self._interrupt_check(task_id),
+                asr_model=ov_model,
+                compute_type=ov_compute,
             )
         finally:
             self._exit_model_group("asr")
@@ -875,20 +923,35 @@ class SmartQueue:
                             transcribe_tokens_per_sec=round(result.get("tokens_per_sec", 0), 1),
                             transcribe_time_s=round(result.get("elapsed", 0), 1),
                             source_chars=result.get("chars", 0))
+        enhanced_flow = self._is_enhanced_flow(task_id)
         if not check.passed:
             logger.warning("转录质检未通过: %s", check.issues)
-            archived = self._archive_review_failed(task_id, video_path, transcript_srt, "transcript")
-            db.create_subtitle(task_id, video_path, archived, "transcript",
-                               status="needs_review", lang=result["language"], score=check.score,
-                               report={"issues": check.issues[:20], "suggestions": check.suggestions[:10]})
-            self._fail(task_id, "转录质检未通过",
-                       suggestion=("转录字幕已归档到「质检未通过字幕目录」" if archived != transcript_srt
-                                   else "转录字幕已保存在视频同目录") + "，可人工查看修正后重新入队")
-            return
-        # 质检通过：不再写质检建议（仅质检未通过的字幕保留 issues/suggestions）
-        db.create_subtitle(task_id, video_path, transcript_srt, "transcript",
-                           status="ok", lang=result["language"], score=check.score,
-                           report={"passed": True})
+            if enhanced_flow:
+                # v1.1.0 增强流程放行：字幕留在视频同目录，不归档、不判失败，继续往下走
+                logger.warning("任务 %s 为增强转录流程，质检未通过（%.1f 分）也放行落盘",
+                               task_id, check.score)
+                db.create_subtitle(task_id, video_path, transcript_srt, "transcript",
+                                   status="needs_review", lang=result["language"], score=check.score,
+                                   report={"issues": check.issues[:20],
+                                           "suggestions": check.suggestions[:10],
+                                           "enhanced_released": True})
+                db.update_task_meta(task_id,
+                                    enhanced_note=f"转录质检未通过（{check.score:.0f} 分），"
+                                                  f"增强流程已放行并保留在视频原目录")
+            else:
+                archived = self._archive_review_failed(task_id, video_path, transcript_srt, "transcript")
+                db.create_subtitle(task_id, video_path, archived, "transcript",
+                                   status="needs_review", lang=result["language"], score=check.score,
+                                   report={"issues": check.issues[:20], "suggestions": check.suggestions[:10]})
+                self._fail(task_id, "转录质检未通过",
+                           suggestion=("转录字幕已归档到「质检未通过字幕目录」" if archived != transcript_srt
+                                       else "转录字幕已保存在视频同目录") + "，可人工查看修正后重新入队")
+                return
+        else:
+            # 质检通过：不再写质检建议（仅质检未通过的字幕保留 issues/suggestions）
+            db.create_subtitle(task_id, video_path, transcript_srt, "transcript",
+                               status="ok", lang=result["language"], score=check.score,
+                               report={"passed": True})
 
         # 源语言 == 目标语言 则无需翻译
         if result["language"] == cfg["target_lang"]:
@@ -947,6 +1010,20 @@ class SmartQueue:
         if ratio >= 0.3:
             from .pipeline.srt_utils import write_srt
             write_srt(segments, target_srt)
+            if self._is_enhanced_flow(task_id):
+                # 增强流程放行：字幕直接留在视频原目录，不归档、不判失败，跳过后继校对与润色
+                db.create_subtitle(task_id, video_path, target_srt, "translated",
+                                   status="needs_review", lang=cfg["target_lang"], score=0,
+                                   report={"issues": [f"翻译未生效：{ratio:.0%} 条目仍为原文"],
+                                           "suggestions": ["检查翻译模型（llm_model）是否支持该语言对，或改用更强模型重跑"],
+                                           "enhanced_released": True})
+                db.update_task_meta(task_id,
+                                    enhanced_note=f"翻译未生效（{ratio:.0%} 条目仍为原文），"
+                                                  f"增强流程已放行，字幕保留在视频原目录")
+                db.update_task(task_id, status="done", stage="done", progress=100, error="")
+                self._emit("task_done", {"id": task_id, "status": "done"})
+                llm_manager.unload_all()
+                return
             archived = self._archive_review_failed(task_id, video_path, target_srt, "translated")
             db.create_subtitle(task_id, video_path, archived, "translated",
                                status="needs_review", lang=cfg["target_lang"], score=0,
@@ -964,26 +1041,40 @@ class SmartQueue:
             llm_manager.prepare_for("polish")
             review = quality_check.review_translation(segments, trans_result.get("model_name", cfg["llm_model"]))
             db.update_task_meta(task_id, translation_score=review.score)
+            released = False
             if not review.passed:
                 logger.warning("翻译校对未通过: %s", review.issues)
                 # 落盘翻译字幕（保留供用户查看），任务标记失败不再进入润色队列
                 from .pipeline.srt_utils import write_srt
                 write_srt(segments, target_srt)
-                archived = self._archive_review_failed(task_id, video_path, target_srt, "translated")
-                db.create_subtitle(task_id, video_path, archived, "translated",
-                                   status="needs_review", lang=cfg["target_lang"], score=review.score,
-                                   report={"issues": review.issues[:20], "suggestions": review.suggestions[:10]})
-                self._fail(task_id, "翻译质检未通过",
-                           suggestion=("翻译字幕已归档到「质检未通过字幕目录」" if archived != target_srt
-                                       else "翻译字幕已保存在视频同目录") + "，可人工修改后重新入队")
-                return
+                if self._is_enhanced_flow(task_id):
+                    # v1.1.0 增强流程放行：字幕留在视频原目录，不归档、不判失败，继续润色
+                    db.create_subtitle(task_id, video_path, target_srt, "translated",
+                                       status="needs_review", lang=cfg["target_lang"], score=review.score,
+                                       report={"issues": review.issues[:20],
+                                               "suggestions": review.suggestions[:10],
+                                               "enhanced_released": True})
+                    db.update_task_meta(task_id,
+                                        enhanced_note=f"翻译质检未通过（{review.score:.0f} 分），"
+                                                      f"增强流程已放行并保留在视频原目录")
+                    released = True
+                else:
+                    archived = self._archive_review_failed(task_id, video_path, target_srt, "translated")
+                    db.create_subtitle(task_id, video_path, archived, "translated",
+                                       status="needs_review", lang=cfg["target_lang"], score=review.score,
+                                       report={"issues": review.issues[:20], "suggestions": review.suggestions[:10]})
+                    self._fail(task_id, "翻译质检未通过",
+                               suggestion=("翻译字幕已归档到「质检未通过字幕目录」" if archived != target_srt
+                                           else "翻译字幕已保存在视频同目录") + "，可人工修改后重新入队")
+                    return
             # 落盘最终字幕
             from .pipeline.srt_utils import write_srt
             write_srt(segments, target_srt)
             # 质检通过（后续润色完工）：不写质检建议，仅失败字幕保留
-            db.create_subtitle(task_id, video_path, target_srt, "translated",
-                               status="ok", lang=cfg["target_lang"], score=review.score,
-                               report={"passed": True})
+            if not released:
+                db.create_subtitle(task_id, video_path, target_srt, "translated",
+                                   status="ok", lang=cfg["target_lang"], score=review.score,
+                                   report={"passed": True})
             # v1.6.9: 润色作为流水线最后一步（仅对译文润色，不覆盖原翻译）
             if cfg.get("polish_enabled", False):
                 self._polish_step(task_id, video_path, cfg, segments)
@@ -1079,12 +1170,15 @@ class SmartQueue:
         self._set_stage(task_id, "transcribing", 6)
         self._enter_stage("transcribing")
         self._enter_model_group("asr")
+        ov_model, ov_compute = self._take_asr_override(task_id)
         try:
-            self._pre_transcribe_unload(task_id)
+            self._pre_transcribe_unload(task_id, ov_model, ov_compute)
             result = transcribe.transcribe(
                 wav,
                 progress_cb=lambda p: self._emit_progress(task_id, _overall("transcribing", p)),
                 cancel_check=lambda: self._interrupt_check(task_id),
+                asr_model=ov_model,
+                compute_type=ov_compute,
             )
         finally:
             self._exit_model_group("asr")

@@ -565,18 +565,56 @@ async def api_clear_all():
     return {"ok": True, "deleted": n}
 
 
+def _resolve_enhanced_retry(enhanced, model=""):
+    """解析「增强转录」参数：是否启用、用哪个 ASR 模型、精度。
+
+    - enhanced=False 或设置里关闭了增强转录 → (False, "", "")
+    - model 为空时取设置 enhanced_asr_model；都为空则退回全局 asr_model
+    """
+    if not enhanced:
+        return False, "", ""
+    if not bool(config.get_setting("enhanced_transcribe_enabled", True)):
+        return False, "", ""
+    name = str(model or "").strip()[:64]
+    if not name:
+        name = str(config.get_setting("enhanced_asr_model") or "").strip()
+    if not name:
+        name = str(config.get_setting("asr_model") or "").strip()
+    compute = str(config.get_setting("enhanced_asr_compute_type") or "").strip()
+    return True, name, compute
+
+
+def _mark_enhanced_retry(task_id, model, compute=""):
+    """给任务打上一次性增强转录标记：强制重转 + 指定模型覆盖。"""
+    db.update_task_meta(
+        task_id,
+        asr_model_override=model or "",
+        asr_compute_override=compute or "",
+        enhanced_retry=bool(model),
+        force_retranscribe=bool(model),
+        enhanced_requested_at=int(time.time()),
+    )
+
+
 @app.post("/api/tasks/retry-failed")
-async def api_retry_failed():
-    """批量重试所有失败任务。"""
+async def api_retry_failed(enhanced: bool = False, model: str = ""):
+    """批量重试所有失败任务。
+
+    enhanced=true 时启用「增强转录」：忽略已有转录结果，用更强的 ASR 模型
+    （默认设置项 enhanced_asr_model，如 large-v3）重新转录视频。
+    """
+    use_enh, enh_model, enh_compute = _resolve_enhanced_retry(enhanced, model)
     failed = db.list_failed_tasks()
     n = 0
     for t in failed:
         db.update_task(t["id"], status="pending", progress=0, error="")
+        if use_enh:
+            _mark_enhanced_retry(t["id"], enh_model, enh_compute)
         smart_queue.submit(t["id"])
         n += 1
     if n:
-        _broadcast("tasks_retried", {"count": n})
-    return {"ok": True, "retried": n}
+        _broadcast("tasks_retried", {"count": n, "enhanced": use_enh, "model": enh_model})
+    return {"ok": True, "retried": n, "enhanced": use_enh, "model": enh_model}
 
 
 @app.get("/api/logs")
@@ -760,16 +798,20 @@ async def api_cancel(task_id: int):
 
 
 @app.post("/api/tasks/{task_id}/retry")
-async def api_retry(task_id: int):
+async def api_retry(task_id: int, enhanced: bool = False, model: str = ""):
+    """重试单个任务。enhanced=true 时用增强转录模型重新转录（忽略已有转录结果）。"""
     t = db.get_task(task_id)
     if not t:
         return {"ok": False, "error": "任务不存在"}
     if t["status"] in ("done", "pending", "extracting", "transcribing", "checking", "translating", "checking_translation"):
         return {"ok": False, "error": f"任务状态 {t['status']} 不可重试"}
+    use_enh, enh_model, enh_compute = _resolve_enhanced_retry(enhanced, model)
     db.update_task(task_id, status="pending", progress=0, error="")
+    if use_enh:
+        _mark_enhanced_retry(task_id, enh_model, enh_compute)
     smart_queue.submit(task_id)
     _broadcast("task_update", {"id": task_id, "status": "pending", "progress": 0})
-    return {"ok": True}
+    return {"ok": True, "enhanced": use_enh, "model": enh_model}
 
 
 @app.delete("/api/tasks/clear-failed")
@@ -837,6 +879,17 @@ async def api_set_config(body: ConfigBody):
                 v = max(1, min(100, int(float(v))))
             except (TypeError, ValueError):
                 v = 20
+        elif k == "enhanced_transcribe_enabled":
+            v = str(v).strip().lower() in ("1", "true", "yes", "on")
+        elif k == "enhanced_asr_model":
+            # 增强转录模型名：仅接受安全字符，空值忽略（保留原设置）
+            v = str(v).strip()[:64]
+            if not v:
+                continue
+        elif k == "enhanced_asr_compute_type":
+            v = str(v).strip()
+            if v not in ("", "float16", "int8", "int8_float16", "int8_float32", "float32"):
+                v = ""
         db.set_setting(k, v)
     get_client().reload()
     # 若监控目录变更则重启 watcher

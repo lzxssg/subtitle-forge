@@ -40,6 +40,8 @@ _COMPUTE_FACTOR = {
 
 # 实际生效的加载参数（可能因显存不足被自动降级），供任务元信息展示
 _last_effective = {"device": "", "compute_type": "", "note": ""}
+# 最近一次实际使用的 ASR 模型名（含增强转录覆盖），供 release_model 精确卸载
+_last_used_model = ""
 
 
 def _asr_provider() -> str:
@@ -191,15 +193,19 @@ def _load_with_fallback(model_name: str, device: str, compute_type: str, cpu_thr
         f"ASR 模型加载失败（显存不足，已尝试卸载 LLM / 降精度 / 回退 CPU）：{last_err}")
 
 
-def get_model():
+def get_model(model_name=None, compute_type=None):
     """懒加载 faster-whisper 模型（线程安全，带缓存，显存不足自动降级）。
 
     优先加载本地已下载目录（{MODELS_DIR}/{model_name}，含 model.bin），
     否则退回 faster-whisper 自动下载（snapshot 缓存布局）。
+
+    model_name / compute_type 为空时取全局设置；传入值时用于「增强转录」
+    等单任务覆盖场景（如失败任务用 large-v3 重跑），缓存键含模型名，
+    两种模型可各自缓存、互不覆盖。
     """
-    model_name = config.get_setting("asr_model")
+    model_name = (model_name or config.get_setting("asr_model") or "small").strip()
     device = _resolve_device()
-    compute_type = config.get_setting("asr_compute_type")
+    compute_type = (compute_type or config.get_setting("asr_compute_type") or "int8").strip()
     cpu_threads = max(1, int(config.get_setting("asr_cpu_threads") or 8))
     if device == "cpu" and compute_type == "float16":
         compute_type = "int8"  # CPU 不支持 float16
@@ -212,13 +218,14 @@ def get_model():
         return model
 
 
-def release_model():
+def release_model(model_name=None):
     """释放 ASR 模型缓存与显存（翻译阶段前调用，避免 ASR 与 LLM 争抢显存）。幂等。
 
     llama 托管模式下：调用 llama-swap 卸载 whisper-{model}，把显存让给翻译/润色 LLM。
+    model_name 为空时按全局 asr_model 处理；增强转录使用的模型由调用方显式传入。
     """
     if _asr_provider() == "llama":
-        model_name = config.get_setting("asr_model")
+        model_name = model_name or _last_used_model or config.get_setting("asr_model")
         llm_manager.unload_model(f"whisper-{model_name}")
         return
     with _model_lock:
@@ -284,11 +291,20 @@ def _run_transcribe(model, wav_path, lang_arg, progress_cb, cancel_check):
     return segments, duration, detected_lang
 
 
-def transcribe(wav_path: str, progress_cb=None, cancel_check=None) -> dict:
-    """转录 wav → segments 列表 + 元信息。llama 托管模式走 whisper.cpp API。"""
+def transcribe(wav_path: str, progress_cb=None, cancel_check=None,
+               asr_model: str = None, compute_type: str = None) -> dict:
+    """转录 wav → segments 列表 + 元信息。llama 托管模式走 whisper.cpp API。
+
+    asr_model / compute_type：单任务模型覆盖（v2.4.0 增强转录）。为空时沿用全局设置。
+    """
+    asr_model = (asr_model or "").strip() or None
+    compute_type = (compute_type or "").strip() or None
     if _asr_provider() == "llama":
-        return _transcribe_via_llamaswap(wav_path, progress_cb, cancel_check)
-    model = get_model()
+        return _transcribe_via_llamaswap(wav_path, progress_cb, cancel_check,
+                                         asr_model=asr_model)
+    model = get_model(asr_model, compute_type)
+    global _last_used_model
+    _last_used_model = asr_model or config.get_setting("asr_model")
     asr_lang = config.get_setting("asr_language") or "auto"
     lang_arg = None if asr_lang == "auto" else asr_lang
 
@@ -301,8 +317,8 @@ def transcribe(wav_path: str, progress_cb=None, cancel_check=None) -> dict:
         if not _is_oom(e):
             raise
         logger.warning("转录推理阶段 OOM：%s，尝试以 int8 重新加载后重试", str(e)[:160])
-        release_model()
-        model = _load_with_fallback(config.get_setting("asr_model"), _resolve_device(),
+        release_model(asr_model)
+        model = _load_with_fallback(asr_model or config.get_setting("asr_model"), _resolve_device(),
                                     "int8_float16", max(1, int(config.get_setting("asr_cpu_threads") or 8)))
         _last_effective["note"] = "推理显存不足，已自动降级为 int8 重跑"
         segments, duration, detected_lang = _run_transcribe(
@@ -315,9 +331,9 @@ def transcribe(wav_path: str, progress_cb=None, cancel_check=None) -> dict:
         "segments": segments,
         "duration": duration,
         "language": detected_lang,
-        "model": config.get_setting("asr_model"),
+        "model": asr_model or config.get_setting("asr_model"),
         "device": _last_effective.get("device") or _resolve_device(),
-        "compute_type": _last_effective.get("compute_type") or config.get_setting("asr_compute_type"),
+        "compute_type": _last_effective.get("compute_type") or compute_type or config.get_setting("asr_compute_type"),
         "device_note": _last_effective.get("note") or "",
         "tokens_per_sec": round(est_tokens / elapsed, 1),
         "elapsed": round(elapsed, 1),
@@ -325,7 +341,8 @@ def transcribe(wav_path: str, progress_cb=None, cancel_check=None) -> dict:
     }
 
 
-def _transcribe_via_llamaswap(wav_path: str, progress_cb=None, cancel_check=None) -> dict:
+def _transcribe_via_llamaswap(wav_path: str, progress_cb=None, cancel_check=None,
+                              asr_model=None) -> dict:
     """llama 托管模式：调用 llama-swap 的 OpenAI 兼容 /v1/audio/transcriptions 转录。
 
     whisper.cpp server 由 llama-swap 按需加载（转录前 queue_manager 已卸载全部 LLM 让显存），
@@ -334,7 +351,9 @@ def _transcribe_via_llamaswap(wav_path: str, progress_cb=None, cancel_check=None
     base = llm_manager.llama_swap_base()
     if not base:
         raise RuntimeError("llama 托管模式需要配置 llm_base_url（指向 llama-swap）")
-    model_name = config.get_setting("asr_model")
+    model_name = (asr_model or "").strip() or config.get_setting("asr_model")
+    global _last_used_model
+    _last_used_model = model_name
     model_id = f"whisper-{model_name}"
     asr_lang = config.get_setting("asr_language") or "auto"
 

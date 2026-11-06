@@ -1,7 +1,7 @@
 services:
   subtitle-forge:
     build: .
-    image: ghcr.io/lzxssg/subtitle-forge:1.0.1
+    image: ghcr.io/lzxssg/subtitle-forge:1.1.1
     # 使用预构建镜像时：注释掉上面的 build，镜像改为
     # image: ghcr.io/lzxssg/subtitle-forge:latest
     container_name: subtitle-forge
@@ -27,6 +27,9 @@ services:
       - ASR_DEVICE=${ASR_DEVICE:-auto}
       - ASR_COMPUTE_TYPE=${ASR_COMPUTE_TYPE:-int8}
       - ASR_LANGUAGE=${ASR_LANGUAGE:-auto}
+      - ENHANCED_TRANSCRIBE_ENABLED=${ENHANCED_TRANSCRIBE_ENABLED:-true}
+      - ENHANCED_ASR_MODEL=${ENHANCED_ASR_MODEL:-large-v3}
+      - ENHANCED_ASR_COMPUTE_TYPE=${ENHANCED_ASR_COMPUTE_TYPE:-}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-qwen2.5:7b}
