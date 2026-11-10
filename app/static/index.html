@@ -252,7 +252,7 @@ button.small.active { background: var(--accent); color: #fff; }
     <div class="logo">🎬</div>
     <div>
       <h1>SubtitleForge 智能字幕工厂</h1>
-      <small>v1.1.1 · by:lzxssg</small>
+      <small id="app-ver">v1.1.5 · by:lzxssg</small>
     </div>
   </div>
   <div class="top-right">
@@ -342,6 +342,7 @@ button.small.active { background: var(--accent); color: #fff; }
           <button class="small btn-func" onclick="retryFailedAll(false)">重试失败</button>
           <button class="small btn-func" onclick="retryFailedAll(true)" title="忽略已有转录结果，用设置里的增强模型重新转录全部失败任务">增强重试</button>
           <button class="small btn-func" onclick="clearFailedTasks()">清空失败</button>
+          <button class="small btn-func" id="repairBtn" onclick="repairQueue()" title="解除队列卡死：强制卸载闲置大模型释放显存、重建工作线程并立即续跑">任务修复</button>
           <button class="small btn-func solid" id="pauseBtn" onclick="toggleQueuePause()">暂停队列</button>
         </div>
       </div>
@@ -540,6 +541,9 @@ button.small.active { background: var(--accent); color: #fff; }
       <div class="form-row"><label>智能队列</label><select id="cfg_smart_queue"><option value="true">开启（去重+优先级+按GPU自动限流）</option><option value="false">关闭（仅按手动并发执行）</option></select><div class="form-hint">开启后：重复文件自动去重、字幕缺失优先、转录/翻译并发由系统按 GPU 型号与显存自动推荐（仍可在下方手动覆盖）。</div></div>
       <div class="form-row"><label>任务线程数</label><select id="cfg_task_workers"><option value="1">1（推荐，受显存约束）</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="6">6</option><option value="8">8</option></select><div class="form-hint">同时处理几个任务（受显存约束）。</div></div>
       <div class="form-row"><label>同批次任务数量上限</label><input type="number" id="cfg_batch_size" min="1" max="100" step="1" value="20" style="width:110px"><div class="form-hint">1-100，默认 20。不论一键扫描出多少任务，只有当前这一批全部跑完（含失败）才会放行下一批；流水线/并行/两阶段模式都受此限制。</div></div>
+      <div class="form-row"><label>看门狗自动修复</label><select id="cfg_watchdog_auto_heal"><option value="true">开启（无人值守自动恢复队列）</option><option value="false">关闭（仅告警，手动修复）</option></select><div class="form-hint">开启后：任务超过「卡死判定阈值」无任何进度，或队列长时间空转（有等待任务却无任务完成、无在跑任务）时，看门狗会自动强杀卡住的进程、解除批次死锁、卸载非工作模型并续跑；两次自动修复至少间隔 5 分钟，正在跑的任务不会被打断。</div></div>
+      <div class="form-row"><label>卡死判定阈值</label><input type="number" id="cfg_watchdog_stuck_seconds" min="60" max="7200" step="30" style="width:110px"><div class="form-hint">秒，默认 900（15 分钟）。任务超过该时长无任何进度即判定卡死。</div></div>
+      <div class="form-row"><label>队列空转判定</label><input type="number" id="cfg_watchdog_idle_seconds" min="120" max="7200" step="30" style="width:110px"><div class="form-hint">秒，默认 600（10 分钟）。有等待任务但长时间既无任务完成、也无任务在跑时，自动修复。</div></div>
       <div class="form-row"><label>转录并发（whisper）</label><select id="cfg_transcribe_workers"><option value="auto">智能自动（按 GPU 型号/显存推荐）</option><option value="1">1（显存紧张推荐）</option><option value="2">2（≥16G 显存）</option><option value="3">3（≥24G 显存）</option><option value="4">4（大显存专用）</option></select><div class="form-hint">同时进行语音转录的任务数，与翻译并发<b>独立</b>：whisper 与 sakura 共享显存，RTX 5060 8G 建议 1。</div></div>
       <div class="form-row"><label>翻译并发（大模型）</label><select id="cfg_translate_workers"><option value="auto">智能自动（按 GPU 型号/显存推荐）</option><option value="1">1（LLM 常驻显存，推荐）</option><option value="2">2（大显存/多卡）</option><option value="3">3（多卡专用）</option><option value="4">4（多卡专用）</option></select><div class="form-hint">同时调用翻译大模型的任务数，与转录并发<b>独立</b>：llama.cpp 单实例已满载 GPU，建议 1；并发只排队不加速。</div></div>
       <div class="form-row"><label>润色并发（大模型）</label><select id="cfg_polish_workers"><option value="auto">智能自动（按 GPU 型号/显存推荐）</option><option value="1">1（8G 显存推荐）</option><option value="2">2（≥12G 显存）</option><option value="3">3（≥24G 显存）</option><option value="4">4（大显存专用）</option></select><div class="form-hint" id="polishWorkersHint">同时润色几条字幕（LLM 推理，与翻译共享 GPU；需任务线程数 ≥ 并发数才生效）。</div></div>
@@ -610,6 +614,11 @@ button.small.active { background: var(--accent); color: #fff; }
 
 <script>
 const $ = id => document.getElementById(id);
+// 版本号取自后端 /api/version，避免前端硬编码与实际镜像漂移
+fetch('/api/version', {cache: 'no-store'}).then(r => r.json()).then(d => {
+  const el = $('app-ver');
+  if (el && d && d.version && d.version !== 'unknown') el.textContent = 'v' + d.version + ' · by:lzxssg';
+}).catch(() => {});
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = n => n == null ? '-' : (typeof n === 'number' ? (Math.round(n*10)/10) : n);
 const STAGE_NAMES = { pending:'排队中', paused:'已暂停', extracting:'提取音频', transcribing:'语音转录', checking:'转录质检', transcribed:'待翻译', translating:'AI 翻译', checking_translation:'翻译校对', polishing:'字幕润色', done:'完成', failed:'失败', cancelled:'已取消', skipped:'已跳过' };
@@ -1052,11 +1061,45 @@ async function multiAddDirs() {
 async function toggleQueuePause() {
   const paused = ($('pauseBtn') && $('pauseBtn').dataset.paused === '1');
   if (!paused && !confirm('暂停队列：将停止领取新任务，并把所有进行中的任务挂起（已完成环节的产物保留，恢复后自动续跑）。确认暂停？')) return;
-  const r = await fetch('/api/queue/pause', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ paused: !paused }) });
+  // 恢复队列时同时执行强制刷新：卸载没有任务在用的 llama 模型，重建工作线程并立即续跑
+  const body = { paused: !paused };
+  if (paused) body.force_unload = true;
+  const r = await fetch('/api/queue/pause', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
   const d = await r.json();
   if (!d.ok) return toast('操作失败');
-  toast(paused ? `队列已恢复，${d.affected ?? 0} 个任务重新入队` : `队列已暂停，${d.affected ?? 0} 个任务挂起`);
-  loadStatus(); loadTasks();
+  if (paused) {
+    const rp = d.repair || {};
+    const un = (rp.unloaded && rp.unloaded.length) ? `，已卸载 ${rp.unloaded.join('/')}` : '';
+    const kd = rp.killed_extract ? `，终止 ${rp.killed_extract} 个卡住提取` : '';
+    toast(`队列已恢复，${d.affected ?? 0} 个任务重新入队${un}${kd}`);
+  } else {
+    toast(`队列已暂停，${d.affected ?? 0} 个任务挂起`);
+  }
+  loadStatus(); loadTasks(); loadStats();
+}
+
+// 任务修复：解除队列卡死 + 释放被其它容器/闲置模型占用的显存 + 立即续跑
+async function repairQueue() {
+  if (!confirm('任务修复将执行：\n1) 强制卸载 llama 当前驻留但没有任务在用的大模型（正在跑翻译/润色的模型不动）\n2) 强杀卡住的音频提取进程\n3) 解除批次死锁、重建工作线程并立即续跑\n4) 按当前阶段预热工作模型\n\n确认执行？')) return;
+  const btn = $('repairBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '修复中…'; }
+  try {
+    const r = await fetch('/api/queue/repair', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ force_unload: true, restart_workers: true }) });
+    const d = await r.json();
+    if (!d || !d.ok) { toast('修复失败'); return; }
+    const rp = d.report || {};
+    const parts = [];
+    if (rp.unloaded && rp.unloaded.length) parts.push(`卸载 ${rp.unloaded.length} 个闲置模型`);
+    if (rp.killed_extract) parts.push(`终止 ${rp.killed_extract} 个卡住提取`);
+    if (rp.fixed_tasks) parts.push(`归位 ${rp.fixed_tasks} 个异常任务`);
+    parts.push(`续跑 ${rp.resumed_tasks || 0} 个任务`);
+    if (rp.workers) parts.push(`工作线程 ${rp.workers}`);
+    toast('任务修复完成：' + parts.join('，'));
+  } catch(e) { toast('修复失败：' + e); }
+  finally {
+    if (btn) { btn.disabled = false; btn.textContent = '任务修复'; }
+    loadStatus(); loadTasks(); loadStats();
+  }
 }
 async function toggleMonitor() {
   const enabled = $('monitorSwitch').checked;
@@ -1634,6 +1677,8 @@ async function loadConfigForm() {
   $('cfg_translation_speed').value = c.translation_speed || 'balanced';
   $('cfg_target_lang').value = c.target_lang || 'zh';
   $('cfg_asr_model').value = c.asr_model || 'small';
+  // fix: 初始化时先拉取 llama-swap 已部署清单，避免误报「暂无已部署模型」
+  try { await refreshAsrModels(); } catch(e) {}
   $('cfg_asr_provider').value = c.asr_provider || 'local';
   updateAsrProviderUI();
   $('cfg_hf_proxy').value = c.hf_proxy || '';
@@ -1647,6 +1692,9 @@ async function loadConfigForm() {
   $('cfg_enhanced_asr_compute_type').value = c.enhanced_asr_compute_type || '';
   $('cfg_task_workers').value = c.task_workers ?? c.max_workers ?? 1;
   if ($('cfg_batch_size')) $('cfg_batch_size').value = c.batch_size ?? 20;
+  if ($('cfg_watchdog_auto_heal')) $('cfg_watchdog_auto_heal').value = (c.watchdog_auto_heal === false || c.watchdog_auto_heal === 'false' || c.watchdog_auto_heal === '0') ? 'false' : 'true';
+  if ($('cfg_watchdog_stuck_seconds')) $('cfg_watchdog_stuck_seconds').value = c.watchdog_stuck_seconds ?? 900;
+  if ($('cfg_watchdog_idle_seconds')) $('cfg_watchdog_idle_seconds').value = c.watchdog_idle_seconds ?? 600;
   $('cfg_transcribe_workers').value = c.transcribe_workers ?? 'auto';
   $('cfg_translate_workers').value = c.translate_workers ?? 1;
   $('cfg_auto_retry_failed').value = c.auto_retry_failed === false || c.auto_retry_failed === 'false' ? 'false' : 'true';
@@ -1706,6 +1754,9 @@ async function saveSettings() {
     enhanced_asr_compute_type: v('cfg_enhanced_asr_compute_type'),
     task_workers: Number(v('cfg_task_workers')) || 1,
     batch_size: Math.max(1, Math.min(100, Number(v('cfg_batch_size')) || 20)),
+    watchdog_auto_heal: v('cfg_watchdog_auto_heal') === 'true',
+    watchdog_stuck_seconds: Math.max(60, Number(v('cfg_watchdog_stuck_seconds')) || 900),
+    watchdog_idle_seconds: Math.max(120, Number(v('cfg_watchdog_idle_seconds')) || 600),
     transcribe_workers: v('cfg_transcribe_workers') || 'auto',
     translate_workers: v('cfg_translate_workers') || 'auto',
     polish_workers: v('cfg_polish_workers') || 'auto',

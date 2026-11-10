@@ -76,6 +76,11 @@ class SmartQueue:
         self._workers = []
         self._stop = False
         self._running_tasks = set()
+        # v1.1.4: 音频缓存自动清理线程（单次启动）
+        self._cache_cleaner_started = False
+        self._cache_first_delay = 45       # 启动后首次清理延迟（秒），等队列恢复完成
+        self._cache_interval = 1800        # 之后每 30 分钟兜底巡检一次
+        self._last_cache_sweep = {}
         # v2.3.0 同批次任务数量限制：
         #   _waiting       等候队列（尚未获准进入当前批次的任务 id，FIFO）
         #   _batch_members 当前批次成员（已放行，含排队中/运行中/等待下一环节）
@@ -112,6 +117,22 @@ class SmartQueue:
         self._prog_last = {}   # task_id -> (ts, progress)
         self._prog_min_interval = 0.8   # 秒
         self._prog_min_delta = 1.0      # 百分点
+        # v1.1.2 看门狗：worker 心跳 + 卡死自愈
+        self._worker_state = {}   # 线程名 -> {"task": task_id|None, "ts": 时间戳}
+        self._last_beat = {}      # task_id -> 最近一次进度时间戳
+        self._stuck_timeout = 900     # 单任务无任何进度超过该秒数视为卡死
+        self._watchdog_started = False
+        self._last_repair = {}    # 最近一次任务修复的结果快照
+        self._repair_summary = {}
+        # v1.1.3 无人值守自愈：连续异常自动执行 repair（限流，避免反复打断在跑任务）
+        self._auto_heal_count = 0
+        self._last_auto_heal = 0.0
+        self._auto_heal_cooldown = 300      # 两次自动修复最小间隔（秒）
+        self._idle_ticks = 0                # 队列空转连续巡检次数
+        self._progress_mark = None          # 上次统计的完成数，用于判断队列是否推进
+        self._last_auto_report = {}
+        self._last_watchdog_reason = ""
+        self._watchdog_interval = 20      # 巡检周期（秒）
 
     @staticmethod
     def _resolve_workers(key: str) -> int:
@@ -153,6 +174,7 @@ class SmartQueue:
         except (TypeError, ValueError):
             return
         now = time.time()
+        self._last_beat[task_id] = now   # 心跳：看门狗据此判断任务是否卡死
         with self._prog_lock:
             last = self._prog_last.get(task_id)
             if (last and p < 100 and p >= last[1]
@@ -268,11 +290,489 @@ class SmartQueue:
             t.start()
             self._workers.append(t)
         self.apply_limits()
+        if not self._watchdog_started:
+            self._watchdog_started = True
+            threading.Thread(target=self._watchdog_loop, daemon=True,
+                             name="queue-watchdog").start()
+        # v1.1.4: 音频缓存清理线程（任务完成即删 + 定期兜底）
+        if not self._cache_cleaner_started:
+            self._cache_cleaner_started = True
+            threading.Thread(target=self._audio_cache_loop, daemon=True,
+                             name="audio-cache-cleaner").start()
         logger.info("队列已启动，workers=%d", len(self._workers))
 
     def stop(self):
         self._stop = True
-        self._q.put(None)  # 唤醒
+        for _ in self._workers:
+            self._q.put(None)  # 逐个唤醒
+        self._q.put(None)
+
+    # ---------- v1.1.4 音频缓存自动清理 ----------
+    @staticmethod
+    def _audio_cache_cfg():
+        """读取清理配置：(总开关, 完成即删, 兜底保留小时数)。"""
+        def _bool(key, default):
+            v = db.get_setting(key, default)
+            if isinstance(v, bool):
+                return v
+            return str(v).strip().lower() not in ("0", "false", "off", "no", "disable", "disabled", "")
+
+        def _int(key, default):
+            try:
+                return max(0, int(float(db.get_setting(key, default) or 0)))
+            except Exception:
+                return default
+
+        return (_bool("audio_cache_cleanup_enabled", True),
+                _bool("audio_cache_cleanup_on_done", True),
+                _int("audio_cache_retention_hours", 24))
+
+    @staticmethod
+    def _audio_file(task_id) -> str:
+        return os.path.join(config.DATA_DIR, "audio", f"task_{task_id}.wav")
+
+    def _drop_task_audio(self, task_id, reason="") -> int:
+        """删除单个任务的临时音频，返回释放字节数。失败不影响主流程。"""
+        path = self._audio_file(task_id)
+        try:
+            if not os.path.exists(path):
+                return 0
+            size = os.path.getsize(path)
+            os.remove(path)
+            logger.info("音频缓存已清理: task_%s.wav（%.1f MiB，%s）",
+                        task_id, size / 1048576, reason or "自动清理")
+            return size
+        except Exception as e:
+            logger.warning("清理 task_%s.wav 失败（忽略）: %s", task_id, e)
+            return 0
+
+    def _maybe_drop_audio_on_done(self, task_id):
+        """任务收尾钩子：成功完成的任务立即释放临时音频。"""
+        try:
+            enabled, on_done, _ = self._audio_cache_cfg()
+            if not (enabled and on_done):
+                return
+            t = db.get_task(task_id)
+            if t and t["status"] == "done":
+                self._drop_task_audio(task_id, "任务已完成")
+        except Exception as e:
+            logger.debug("任务完成后清理音频异常（忽略）: %s", e)
+
+    def sweep_audio_cache(self) -> dict:
+        """兜底巡检：done 立即删；failed/cancelled/孤儿 超过保留期删；运行中绝不删。"""
+        enabled, on_done, hours = self._audio_cache_cfg()
+        result = {"enabled": enabled, "removed": 0, "freed": 0, "skipped_running": 0}
+        if not enabled:
+            return result
+        audio_dir = os.path.join(config.DATA_DIR, "audio")
+        if not os.path.isdir(audio_dir):
+            return result
+        cutoff = time.time() - hours * 3600
+        running = set(self._running_tasks)
+        try:
+            names = os.listdir(audio_dir)
+        except OSError as e:
+            logger.warning("读取音频缓存目录失败: %s", e)
+            return result
+        for name in names:
+            if not (name.startswith("task_") and name.endswith(".wav")):
+                continue
+            try:
+                task_id = int(name[len("task_"):-len(".wav")])
+            except ValueError:
+                continue
+            if task_id in running:
+                result["skipped_running"] += 1
+                continue
+            path = os.path.join(audio_dir, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            try:
+                task = db.get_task(task_id)
+            except Exception:
+                task = None
+            status = (task["status"] if task else "") or ""
+            drop = False
+            if not task:
+                drop = mtime < cutoff              # 孤儿缓存：超保留期
+            elif status == "done":
+                drop = on_done or mtime < cutoff   # 已完成：默认立即释放
+            elif status in ("failed", "cancelled"):
+                drop = mtime < cutoff              # 失败/取消：留足排查与重试窗口
+            if drop:
+                freed = self._drop_task_audio(task_id, f"状态={status or '无记录'}")
+                if freed:
+                    result["removed"] += 1
+                    result["freed"] += freed
+        if result["removed"]:
+            logger.info("音频缓存巡检完成：清理 %d 个文件，释放 %.2f GiB（运行中跳过 %d）",
+                        result["removed"], result["freed"] / 1073741824,
+                        result["skipped_running"])
+        result["at"] = time.time()
+        self._last_cache_sweep = result
+        return result
+
+    def _audio_cache_loop(self):
+        """启动后延迟首扫（清理历史积压），之后每 30 分钟兜底巡检。"""
+        try:
+            time.sleep(self._cache_first_delay)
+        except Exception:
+            pass
+        while not self._stop:
+            try:
+                self.sweep_audio_cache()
+            except Exception as e:
+                logger.warning("音频缓存巡检异常（忽略）: %s", e)
+            for _ in range(max(1, int(self._cache_interval))):
+                if self._stop:
+                    return
+                time.sleep(1)
+
+    # ---------- v1.1.2 队列看门狗 / 任务修复 ----------
+    def _watchdog_loop(self):
+        """每 20 秒巡检一次：卡死 → 强杀其外部进程；持续异常 → 无人值守自动 repair。"""
+        while True:
+            time.sleep(self._watchdog_interval)
+            try:
+                self._watchdog_tick()
+            except Exception as e:
+                logger.warning("队列看门狗巡检异常（忽略）: %s", e)
+
+    def _watchdog_cfg(self):
+        """读取看门狗配置：(自动修复开关, 卡死阈值秒, 空转阈值秒)。"""
+        def _int(key, default, low):
+            try:
+                return max(low, int(float(db.get_setting(key) or default)))
+            except Exception:
+                return default
+        auto = str(db.get_setting("watchdog_auto_heal", "true")).strip().lower()
+        auto = auto not in ("0", "false", "off", "no", "disable", "disabled")
+        return (auto,
+                _int("watchdog_stuck_seconds", 60, 15),
+                _int("watchdog_idle_seconds", 180, 60))
+
+    def _watchdog_tick(self) -> dict:
+        """单次巡检。返回 {stuck, idle_ticks, healed, report?}。"""
+        auto, stuck_secs, idle_secs = self._watchdog_cfg()
+        now = time.time()
+        self._last_watchdog_check = now
+        # 用户主动暂停队列时不做空转判定与自动修复（暂停不等于故障）
+        try:
+            paused = bool(db.get_setting("queue_paused", False))
+        except Exception:
+            paused = False
+        if paused:
+            self._idle_ticks = 0
+            return {"stuck": [], "idle_ticks": 0, "healed": False, "skipped": "queue_paused"}
+        stuck = []
+        for name, st in list(self._worker_state.items()):
+            tid = st.get("task")
+            if not tid:
+                continue
+            last = max(st.get("ts") or 0, self._last_beat.get(tid, 0))
+            age = now - last
+            if age < stuck_secs:
+                continue
+            try:
+                t = db.get_task(tid)
+            except Exception:
+                t = None
+            status = (t or {}).get("status")
+            if status in ("cancelled", "paused", "failed", "done"):
+                # 任务已被取消/暂停但进程仍卡着：强杀，让 worker 线程自行返回
+                if extract_audio.kill_task(tid):
+                    logger.warning("看门狗：任务 %s 状态为 %s 但提取进程卡住，已强制终止",
+                                   tid, status)
+                continue
+            stuck.append({"task": tid, "status": status,
+                          "idle": int(age), "worker": name})
+            logger.warning("看门狗：任务 %s 已 %d 秒无进度（状态 %s，worker %s）",
+                           tid, int(age), status, name)
+
+        # 存活线程不足且有积压时补线程（卡死线程无法 kill，补齐消费者即可恢复队列）
+        alive = [t for t in self._workers if t.is_alive()]
+        backlog = self._q.qsize() + len(self._waiting)
+        if backlog and len(alive) < max(1, self.worker_count()):
+            logger.warning("看门狗：存活 worker %d/%d，队列积压 %d，补充工作线程",
+                           len(alive), self.worker_count(), backlog)
+            self._spawn_worker()
+
+        # 队列空转判定：有等待任务、无在跑任务，且完成数长时间不增
+        try:
+            progressed = sum(db.count_by_status((s,)) for s in ("done", "failed"))
+        except Exception:
+            progressed = self._progress_mark
+        if self._progress_mark is None:
+            self._progress_mark = progressed
+        if progressed == self._progress_mark:
+            if len(self._waiting) > 0 and not self._running_tasks:
+                self._idle_ticks += 1
+            else:
+                self._idle_ticks = 0
+        else:
+            self._idle_ticks = 0
+            self._progress_mark = progressed
+        idle_hit = (self._idle_ticks * self._watchdog_interval) >= idle_secs
+
+        reason = ""
+        if stuck:
+            reason = "任务 %s 无进度超过 %ds" % (
+                ",".join(str(s["task"]) for s in stuck[:3]), stuck_secs)
+        elif idle_hit:
+            reason = "队列空转 %d 次巡检（等待 %d 条、无在跑任务）" % (
+                self._idle_ticks, len(self._waiting))
+        if not reason:
+            return {"stuck": stuck, "idle_ticks": self._idle_ticks, "healed": False}
+
+        if not auto:
+            logger.warning("看门狗：%s；自动修复已关闭（watchdog_auto_heal=false），"
+                           "请手动点击「任务修复」", reason)
+            return {"stuck": stuck, "idle_ticks": self._idle_ticks, "healed": False}
+        if now - self._last_auto_heal < self._auto_heal_cooldown:
+            logger.info("看门狗：%s；距上次自动修复不足 %ds，跳过本轮",
+                        reason, self._auto_heal_cooldown)
+            return {"stuck": stuck, "idle_ticks": self._idle_ticks, "healed": False}
+
+        self._last_auto_heal = now
+        self._last_watchdog_reason = reason
+        try:
+            report = self.repair(force_unload=True, restart_workers=True,
+                                 reason="看门狗自动修复：" + reason)
+        except Exception as e:
+            logger.error("看门狗：自动修复失败：%s", e)
+            self._last_auto_report = {"ok": False, "ts": now, "reason": reason,
+                                      "error": str(e)}
+            return {"stuck": stuck, "idle_ticks": self._idle_ticks, "healed": False}
+        self._auto_heal_count += 1
+        self._idle_ticks = 0
+        self._progress_mark = None
+        self._last_auto_report = {
+            "ok": bool(report.get("ok")), "ts": now, "reason": reason,
+            "killed_extract": report.get("killed_extract"),
+            "fixed_tasks": report.get("fixed_tasks"),
+            "resumed_tasks": report.get("resumed_tasks"),
+            "workers": report.get("workers"),
+            "unloaded": report.get("unloaded"),
+        }
+        logger.warning("看门狗：已自动修复 #%d（%s）→ 终止提取 %s、归位 %s、续跑 %s、workers=%s",
+                       self._auto_heal_count, reason, report.get("killed_extract"),
+                       report.get("fixed_tasks"), report.get("resumed_tasks"),
+                       report.get("workers"))
+        self._emit("queue_repair", self._last_auto_report)
+        return {"stuck": stuck, "idle_ticks": 0, "healed": True,
+                "report": self._last_auto_report}
+
+    def _spawn_worker(self):
+        name = f"worker-{len(self._workers)}"
+        t = threading.Thread(target=self._run_loop, daemon=True, name=name)
+        t.start()
+        self._workers.append(t)
+        return t
+
+    def repair(self, force_unload: bool = True, restart_workers: bool = True,
+               reason: str = "任务修复") -> dict:
+        """任务修复：解除卡死批次、释放被其它容器/闲置模型占用的显存、重铺工作模型并立即续跑。
+
+        典型适用场景：
+          1) ffmpeg 管道卡死导致 worker 线程不再消费任务（进行中 0、等待几百条）；
+          2) 其它容器抢显存 / llama-swap 里驻留着上次用过的模型，ASR 与 LLM 抢卡；
+          3) 批次闸门死锁：批次成员全停在中间态，后续任务永不放行。
+        force_unload=True 时只卸载「没有任务在用」的大模型，正在跑翻译/润色的模型不动。
+        """
+        from .services import llm_manager
+        from .pipeline import extract_audio as _ex
+
+        report = {"ok": True, "reason": reason, "actions": [], "unloaded": [],
+                  "kept": [], "killed_extract": 0, "fixed_tasks": 0,
+                  "resumed_tasks": 0, "workers": 0, "batch": {},
+                  "vram_before_mb": 0, "vram_after_mb": 0, "vram_free_mb": 0,
+                  "warmup": False, "loaded_before": [], "loaded_after": []}
+        try:
+            report["vram_before_mb"] = int(llm_manager.gpu_vram_used_mb() or 0)
+        except Exception:
+            pass
+
+        # 1) 卸载闲置的 LLM 模型，把显存让给当前阶段真正要用的模型
+        llm_busy = bool(db.count_by_status(("translating", "checking_translation", "polishing")))
+        if force_unload:
+            try:
+                before = llm_manager.loaded_models()
+                report["loaded_before"] = list(before)
+                if llm_busy:
+                    # 保留当前各阶段可能正在使用的模型，只卸载其余闲置模型
+                    keep = set()
+                    try:
+                        for key in ("llm_model", "review_model", "polish_model"):
+                            name = str(db.get_setting(key) or "").strip().lower()
+                            if not name:
+                                continue
+                            for m in llm_manager._swap_models():
+                                if name in m.lower() or m.lower() in name:
+                                    keep.add(m)
+                    except Exception:
+                        pass
+                    llm_manager.unload_others(keep=sorted(keep))
+                    report["actions"].append(
+                        "检测到翻译/润色任务在跑，仅卸载非工作模型（保留 %s）"
+                        % ("/".join(sorted(keep)) or "全部"))
+                else:
+                    llm_manager.unload_all()
+                    report["actions"].append("已强制卸载 llama 当前驻留模型，显存让给工作模型")
+                after = llm_manager.loaded_models()
+                report["loaded_after"] = list(after)
+                report["unloaded"] = [m for m in before if m not in after]
+                report["kept"] = [m for m in after if m in before]
+            except Exception as e:
+                report["actions"].append(f"卸载模型失败：{e}")
+
+        # 2) 强杀卡住的 ffmpeg：只杀「心跳停滞 / 不在运行集合」的提取进程，正常在跑的不动
+        running = set(self._running_tasks)
+        try:
+            now = time.time()
+            stale = []
+            for tid in _ex.active_task_ids():
+                if tid in running and now - self._last_beat.get(tid, 0) < 120:
+                    continue  # 正常在跑且有心跳
+                stale.append(tid)
+            report["killed_extract"] = _ex.kill_tasks(stale)
+        except Exception:
+            pass
+
+        # 3) 解除批次闸门死锁：清空等候队列，在跑任务保留为当前批次成员
+        with self._batch_lock:
+            self._waiting.clear()
+            self._waiting_set.clear()
+            self._batch_members = [t for t in running]
+            self._in_flight = set(running)
+            self._requeue.clear()
+            self._translate_submitted.clear()
+            self._batch_no = 0
+            while True:
+                try:
+                    tid = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if tid is not None and tid not in running:
+                    self._in_flight.discard(tid)
+            self._sakura_stopped = False
+            self._translation_started = False
+
+        # 4) 中间态任务归位（跳过仍在运行的任务）：保留已产出的断点文件，重新排队
+        fixed = 0
+        for st in ("extracting", "transcribing", "checking"):
+            for r in db.list_tasks_by_status([st]):
+                if r["id"] in running:
+                    continue
+                db.update_task(r["id"], status="pending", error="")
+                fixed += 1
+        for r in db.list_tasks_by_status(["paused"]):
+            if r["id"] in running:
+                continue
+            db.update_task(r["id"], status="pending", error="")
+            fixed += 1
+        report["fixed_tasks"] = fixed
+
+        # 5) 恢复队列标记
+        db.set_setting("queue_paused", False)
+
+        # 6) 重建工作线程（有任务在跑时只补充线程，绝不打断在跑任务）
+        running_now = set(self._running_tasks)
+        if restart_workers and not running_now:
+            self._stop = True
+            for _ in self._workers:
+                self._q.put(None)
+            time.sleep(0.8)
+            self._workers = [t for t in self._workers if t.is_alive()]
+            self._worker_state.clear()
+            self._stop = False
+            self.start()
+        elif restart_workers:
+            alive = [t for t in self._workers if t.is_alive()]
+            target = max(1, self.worker_count())
+            while len(alive) < target:
+                alive.append(self._spawn_worker())
+            report["actions"].append("有任务正在运行，仅补充空闲工作线程（不打断在跑任务）")
+        report["workers"] = len([t for t in self._workers if t.is_alive()])
+
+        # 7) 重新入队并放行
+        rows = db.list_tasks_by_status(["pending"])
+        for r in rows:
+            self.submit(r["id"])
+        report["resumed_tasks"] = len(rows)
+        self._emit("queue_paused", {"paused": False, "count": len(rows)})
+        self._emit("batch_update", self.batch_state())
+
+        # 8) 需要 LLM 的阶段提前预热工作模型（llama-swap 懒加载，冷启动易 502）
+        need_translate = (not rows) and bool(
+            db.list_tasks_by_status(["transcribed"], limit=1))
+        if need_translate:
+            try:
+                report["warmup"] = bool(llm_manager.warmup_stage_model("translate"))
+                if report["warmup"]:
+                    report["actions"].append("已预热翻译工作模型")
+            except Exception:
+                pass
+
+        try:
+            report["vram_after_mb"] = int(llm_manager.gpu_vram_used_mb() or 0)
+            report["vram_free_mb"] = int(llm_manager.free_vram_mb() or 0)
+        except Exception:
+            pass
+        report["batch"] = self.batch_state()
+        self._last_repair = report
+        logger.info("任务修复完成: %s", report)
+        return report
+
+    def repair_state(self) -> dict:
+        return self._last_repair
+
+    def health(self) -> dict:
+        """只读健康快照：worker 心跳/卡死判定、队列积压、批次、自愈状态。"""
+        now = time.time()
+        auto, stuck_secs, idle_secs = self._watchdog_cfg()
+        workers, stuck = [], []
+        for name, st in list(self._worker_state.items()):
+            tid = st.get("task")
+            last = max(st.get("ts") or 0, self._last_beat.get(tid, 0)) if tid else (st.get("ts") or now)
+            age = now - last
+            workers.append({"worker": name, "task": tid, "idle_seconds": round(age, 1)})
+            if tid and age > stuck_secs:
+                stuck.append(tid)
+        try:
+            progressed = sum(db.count_by_status((s,)) for s in ("done", "failed"))
+        except Exception:
+            progressed = None
+        return {
+            "paused": bool(db.get_setting("queue_paused", False)),
+            "workers": workers,
+            "alive_workers": len([t for t in self._workers if t.is_alive()]),
+            "stuck_workers": stuck,
+            "running": len(self._running_tasks),
+            "waiting": len(self._waiting),
+            "queued": self._q.qsize(),
+            "active_extract": len(extract_audio.active_task_ids()),
+            "finished": progressed,
+            "stuck_timeout_seconds": stuck_secs,
+            "watchdog": {
+                "interval_seconds": self._watchdog_interval,
+                "auto_heal": auto,
+                "idle_threshold_seconds": idle_secs,
+                "idle_ticks": self._idle_ticks,
+                "auto_heal_count": self._auto_heal_count,
+                "last_auto_heal": self._last_auto_heal,
+                "last_auto_age_seconds": (round(now - self._last_auto_heal, 1)
+                                          if self._last_auto_heal else None),
+                "cooldown_seconds": self._auto_heal_cooldown,
+                "last_trigger": self._last_watchdog_reason,
+                "last_check_age_seconds": (round(now - self._last_watchdog_check, 1)
+                                           if self._last_watchdog_check else None),
+                "last_report": self._last_auto_report,
+            },
+            "batch": self.batch_state(),
+            "last_repair": self._last_repair,
+        }
 
     # ---------- v2.3.0 同批次任务数量限制（批次闸门） ----------
     BATCH_ACTIVE_STATUSES = ("pending", "extracting", "transcribing", "checking",
@@ -456,8 +956,17 @@ class SmartQueue:
         logger.info("队列已暂停，%d 个任务挂起", n)
         return n
 
-    def resume_all(self) -> int:
-        """恢复队列：清除暂停标记，把所有 paused 任务重新入队。"""
+    def resume_all(self, force_unload: bool = False) -> int:
+        """恢复队列：清除暂停标记，把所有 paused 任务重新入队。
+
+        force_unload=True 时走一次任务修复：强制卸载闲置大模型（不打断在跑任务）、
+        解除批次死锁、重建工作线程并预热工作模型，做到「一键恢复且立即续跑」。
+        """
+        if force_unload:
+            report = self.repair(force_unload=True, restart_workers=True,
+                                 reason="恢复队列（强制卸载并续跑）")
+            self._repair_summary = report
+            return int(report.get("resumed_tasks") or 0)
         db.set_setting("queue_paused", False)
         rows = db.list_tasks_by_status(["paused"])
         for r in rows:
@@ -514,40 +1023,51 @@ class SmartQueue:
             return cur.rowcount
 
     def _run_loop(self):
+        name = threading.current_thread().name
         while not self._stop:
-            # 队列暂停时不领取新任务（进行中任务不受影响）
-            if db.get_setting("queue_paused", False):
-                time.sleep(1)
-                continue
-            # staged 模式：动态管理 LLM 容器显存（转录时停 Sakura，全部转录完再启动翻译）
-            if self._phase_mode() == "staged" and not self.is_parallel():
-                self._staged_checkpoint()
+            self._worker_state[name] = {"task": None, "ts": time.time()}
             try:
-                task_id = self._q.get(timeout=2)
-            except queue.Empty:
-                # 空闲时清理批次中已取消/暂停/删除的成员，避免批次无法收尾
-                self._sweep_batch()
-                continue
-            if task_id is None:
-                continue
-            try:
-                # staged 模式：转录类任务执行前立即停 LLM 容器释放显存
+                # 队列暂停时不领取新任务（进行中任务不受影响）
+                if db.get_setting("queue_paused", False):
+                    time.sleep(1)
+                    continue
+                # staged 模式：动态管理 LLM 容器显存（转录时停 Sakura，全部转录完再启动翻译）
                 if self._phase_mode() == "staged" and not self.is_parallel():
-                    t = db.get_task(task_id)
-                    if t and t["status"] in TRANSCRIBE_STATUSES and not self._sakura_stopped:
-                        if self._sakura_running():
-                            if self._stop_sakura():
-                                self._sakura_stopped = True
-                self._process(task_id)
+                    self._staged_checkpoint()
+                try:
+                    task_id = self._q.get(timeout=2)
+                except queue.Empty:
+                    # 空闲时清理批次中已取消/暂停/删除的成员，避免批次无法收尾
+                    self._sweep_batch()
+                    continue
+                if task_id is None:
+                    continue
+                self._worker_state[name] = {"task": task_id, "ts": time.time()}
+                self._last_beat[task_id] = time.time()
+                try:
+                    # staged 模式：转录类任务执行前立即停 LLM 容器释放显存
+                    if self._phase_mode() == "staged" and not self.is_parallel():
+                        t = db.get_task(task_id)
+                        if t and t["status"] in TRANSCRIBE_STATUSES and not self._sakura_stopped:
+                            if self._sakura_running():
+                                if self._stop_sakura():
+                                    self._sakura_stopped = True
+                    self._process(task_id)
+                except Exception as e:
+                    logger.error("任务 %s 处理异常: %s", task_id, e)
+                    traceback.print_exc()
+                    self._fail(task_id, f"内部异常: {e}", suggestion="请查看容器日志")
+                finally:
+                    self._running_tasks.discard(task_id)
+                    self._clear_progress_state(task_id)
+                    self._worker_state[name] = {"task": None, "ts": time.time()}
+                    # 批次收尾：本任务结束（含失败）后释放名额；整批结束才放行下一批
+                    self._on_task_finished(task_id)
             except Exception as e:
-                logger.error("任务 %s 处理异常: %s", task_id, e)
+                # 任何未预料的异常都不能让 worker 线程退出，否则队列将永久空转
+                logger.error("worker %s 主循环异常（已保护，继续运行）: %s", name, e)
                 traceback.print_exc()
-                self._fail(task_id, f"内部异常: {e}", suggestion="请查看容器日志")
-            finally:
-                self._running_tasks.discard(task_id)
-                self._clear_progress_state(task_id)
-                # 批次收尾：本任务结束（含失败）后释放名额；整批结束才放行下一批
-                self._on_task_finished(task_id)
+                time.sleep(1)
 
     # ---------- staged 两阶段模式 ----------
     def _phase_mode(self):
@@ -871,6 +1391,8 @@ class SmartQueue:
             self._fail_with_advice(task_id, str(e))
         finally:
             self._running_tasks.discard(task_id)
+            # v1.1.4: 任务成功完成后立即释放临时音频（失败/取消保留，交由定时巡检兜底）
+            self._maybe_drop_audio_on_done(task_id)
 
     def _full_pipeline(self, task_id, video_path, target_srt, cfg):
         # 1) 提取音频
@@ -878,7 +1400,9 @@ class SmartQueue:
         wav = _wav_path(video_path, task_id)
         extract_audio.extract_audio(
             video_path, wav,
-            progress_cb=lambda p: self._emit_progress(task_id, _overall("extracting", p)))
+            progress_cb=lambda p: self._emit_progress(task_id, _overall("extracting", p)),
+            cancel_cb=lambda: self._interrupt_check(task_id),
+            task_id=task_id)
         duration = extract_audio.probe_duration(video_path)
 
         # 2) 转录（v1.7.0: 套阶段并发门，转录并发受 transcribe_workers 限制）
@@ -1163,7 +1687,9 @@ class SmartQueue:
         wav = _wav_path(video_path, task_id)
         extract_audio.extract_audio(
             video_path, wav,
-            progress_cb=lambda p: self._emit_progress(task_id, _overall("extracting", p)))
+            progress_cb=lambda p: self._emit_progress(task_id, _overall("extracting", p)),
+            cancel_cb=lambda: self._interrupt_check(task_id),
+            task_id=task_id)
         duration = extract_audio.probe_duration(video_path)
 
         # 2) 转录（套阶段并发门，受 transcribe_workers 限制）

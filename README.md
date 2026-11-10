@@ -2,7 +2,38 @@
 
 自动为影视文件生成中文字幕的全流程工具：语音转录 → 转录质检 → AI 翻译 → 翻译校对 → 大模型润色，最终输出自然地道的中文字幕（`.zh.srt` / `.zh.rs.srt`）。支持监控目录自动入队、Jellyfin/Emby 媒体入库联动、Web 端实时进度管理。
 
-**当前版本：v1.1.1** · [更新日志](CHANGELOG.md) · [发布指引](RELEASE.md)
+**当前版本：v1.1.5** · [更新日志](CHANGELOG.md) · [发布指引](RELEASE.md)
+
+## v1.1.5 更新功能
+
+| 类别 | 内容 |
+| --- | --- |
+| ASR 托管误报修复 | 设置页初始化时先拉取已部署模型清单再渲染 ASR 托管状态，切换 `llama`（llama-swap 托管）不再误报「暂无已部署模型」 |
+| 版本一致性 | `APP_VERSION`、`VERSION` 与镜像 tag 统一为 `1.1.5` |
+
+## v1.1.4 更新功能
+
+| 类别 | 内容 |
+| --- | --- |
+| 音频缓存自动清理 | 任务完成后立即删除对应 `task_*.wav`；新增 `audio-cache-cleaner` 线程，启动 45s 后首扫、此后每 30 分钟巡检：`done` 直接清，`failed` / `cancelled` 超过保留期清，孤儿缓存超期清，运行中任务一律跳过 |
+| 手动清理增强 | `POST /api/cache/clear` 跳过运行中任务，返回 `removed` / `freed` / `skipped_running` |
+| 状态与版本接口 | 新增 `GET /api/cache/status`（文件数、总字节、清理开关、保留时长、上次巡检）与 `GET /api/version`；页面版本号改为运行时拉取，避免与镜像版本漂移 |
+
+## v1.1.3 更新功能
+
+| 类别 | 内容 |
+| --- | --- |
+| 看门狗自动修复 | 20s 巡检两类异常：任务卡死（worker 心跳停滞超过 `watchdog_stuck_seconds`，默认 60s）与队列空转（有等待任务、无在跑任务且完成数在 `watchdog_idle_seconds` 内不增长）；命中后自动卸载非工作模型、只强杀心跳停滞的 ffmpeg、解除批次闸门死锁、中间态归位、重建工作线程并续跑 |
+| 冷却保护 | 自动修复有 300s 冷却；正在运行的任务永不被打断 |
+| 可观测 | 每次修复写日志并通过 SSE `queue_repair` 推送前端 |
+
+## v1.1.2 更新功能
+
+| 类别 | 内容 |
+| --- | --- |
+| 提取死锁修复 | ffmpeg stdout 改由独立读线程投递，stderr 落临时文件，主线程按 `proc.poll()` 轮询退出码，解决写满管道导致的 worker 永久卡死 |
+| 双超时保护 | 空闲超时（默认 120s 无输出）与总时长超时，超时即终止进程；任务取消/暂停时立即终止对应 ffmpeg |
+| 任务修复 | 新增 `POST/GET /api/queue/repair` 与前端「任务修复」按钮；恢复队列支持 `force_unload` 先卸载闲置模型 |
 
 ## v1.1.1 更新功能
 
@@ -179,7 +210,9 @@ docker compose up -d --build
 | `QUEUE_PAUSED` | `false` | 启动时是否暂停队列 |
 | `WATCH_DIRS` | `/Media` | 监控目录（容器内路径，逗号分隔） |
 | `SCAN_INTERVAL_MINUTES` | `60` | 自动扫描间隔 |
+| `SCAN_INTERVAL_VALUE` / `SCAN_INTERVAL_UNIT` | `60` / `minutes` | 定时扫描的数值与单位（`minutes` / `hours`） |
 | `TASK_WORKERS` | `1` | 任务线程数 |
+| `TRANSCRIBE_WORKERS` / `TRANSLATE_WORKERS` | `auto` | 转录 / 翻译并发数，`auto` 按设备与显存自动决定 |
 | `BATCH_SIZE` | `20` | 同批次任务数量上限（1–100），整批结束才放行下一批 |
 | `SMART_QUEUE` | `true` | 智能队列（去重 + 优先级 + 限流） |
 | `MULTI_MODEL_VRAM_MB` | `16000` | 多模型共存所需显存阈值 |
@@ -210,11 +243,18 @@ docker compose up -d --build
 | `SUBTITLE_SUFFIX` | `.zh` | 字幕后缀 |
 | `TRANSCRIPT_QUALITY_THRESHOLD` | `60` | 转录质检阈值 |
 | `TRANSLATION_QUALITY_THRESHOLD` | `70` | 翻译质检阈值 |
+| `AUDIO_CACHE_CLEANUP_ENABLED` | `true` | 是否启用音频缓存自动清理 |
+| `AUDIO_CACHE_CLEANUP_ON_DONE` | `true` | 任务完成后立即删除对应 `task_*.wav` |
+| `AUDIO_CACHE_RETENTION_HOURS` | `24` | 失败/取消任务与孤儿缓存的保留时长（小时） |
 | `LLAMA_MODELS_HOST` | 空 | 宿主模型目录，映射到容器 `/models-llama` |
 | `LLAMA_SWAP_CONFIG` | `/config-llama.yaml` | llama-swap 配置文件路径 |
 | `LLAMA_SWAP_CONTAINER` | `llama-swap` | llama-swap 容器名 |
+| `SAKURA_CONTAINER` | `llama-sakura` | 备用翻译模型容器名（llama-swap 托管模式下使用） |
 | `WEBHOOK_ENABLED` | `false` | 媒体联动 Webhook 开关 |
 | `WEBHOOK_SECRET` | 空 | Webhook 共享密钥（留空不校验） |
+| `WEBHOOK_EVENTS` | `ItemAdded,ItemUpdated,LibraryNew` | 触发事件 |
+| `WEBHOOK_MEDIA_TYPES` | `Movie,Episode` | 触发媒体类型 |
+| `WEBHOOK_PATH_MAP` | 空 | 媒体库路径到容器内路径的映射，形如 `/media=/Media` |
 
 ## 媒体联动（Webhook）
 

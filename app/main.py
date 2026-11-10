@@ -154,11 +154,20 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    smart_queue.stop()
+    try:
+        smart_queue.stop()
+    except Exception as e:
+        logger.warning("停止队列异常（忽略）: %s", e)
     if hasattr(app.state, "watcher"):
-        app.state.watcher.stop()
+        try:
+            app.state.watcher.stop()
+        except Exception as e:
+            logger.warning("停止目录监听异常（忽略）: %s", e)
     if hasattr(app.state, "scheduler"):
-        app.state.scheduler.shutdown(wait=False)
+        try:
+            app.state.scheduler.shutdown(wait=False)
+        except Exception as e:
+            logger.warning("停止调度器异常（忽略）: %s", e)
     if _stop_events:
         _stop_events[0].set()
 
@@ -301,6 +310,12 @@ def _task_row(task, subtitles=None):
         row["subtitles"] = subtitles
     row["file_size"] = _file_size(task["video_path"])
     return row
+
+
+@app.get("/api/version")
+async def api_version():
+    """返回后端版本号（v1.1.4 起提供），前端据此显示，避免硬编码漂移。"""
+    return {"ok": True, "version": getattr(config, "APP_VERSION", "unknown")}
 
 
 @app.get("/api/status")
@@ -533,6 +548,7 @@ async def api_set_mode(body: ModeBody):
 
 class QueuePauseBody(BaseModel):
     paused: bool
+    force_unload: bool = False
 
 
 @app.post("/api/queue/pause")
@@ -540,14 +556,54 @@ async def api_queue_pause(body: QueuePauseBody):
     """暂停/恢复任务队列。
 
     暂停：不再领取新任务，并把所有进行中的任务挂起（已完成的环节产物保留，恢复后续跑）。
-    恢复：所有暂停任务重新入队。
+    恢复：所有暂停任务重新入队；force_unload=True 时同时执行任务修复
+          （强制卸载闲置 LLM 模型释放显存 → 解除批次死锁 → 重建工作线程 → 预热工作模型 → 立即续跑）。
     """
     if body.paused:
         n = smart_queue.pause_all()
     else:
-        n = smart_queue.resume_all()
+        n = smart_queue.resume_all(force_unload=body.force_unload)
     _broadcast("task_update", {"queue_paused": body.paused, "affected": n})
-    return {"ok": True, "paused": body.paused, "affected": n}
+    resp = {"ok": True, "paused": body.paused, "affected": n}
+    if not body.paused and body.force_unload:
+        resp["repair"] = smart_queue.repair_state()
+    return resp
+
+
+class RepairBody(BaseModel):
+    force_unload: bool = True
+    restart_workers: bool = True
+    reason: str = "任务修复"
+
+
+@app.post("/api/queue/repair")
+async def api_queue_repair(body: RepairBody = None):
+    """任务修复：一键恢复队列并排查显存/死锁问题。
+
+    动作：强制卸载 llama-swap 中当前驻留、但没有任务在用的模型（正在跑翻译/润色的不动）
+    → 强杀卡住的音频提取进程 → 解除批次闸门死锁 → 中间态任务归位 → 重建工作线程
+    → 重新入队并放行 → 按阶段预热工作模型。
+    """
+    body = body or RepairBody()
+    report = smart_queue.repair(force_unload=body.force_unload,
+                                restart_workers=body.restart_workers,
+                                reason=body.reason or "任务修复")
+    _broadcast("batch_update", smart_queue.batch_state())
+    return {"ok": True, "report": report}
+
+
+@app.get("/api/queue/repair")
+async def api_queue_repair_state():
+    """只读健康快照：worker 心跳/卡死、队列积压、批次、提取进程，附最近一次修复结果。"""
+    return {"ok": True, "health": smart_queue.health(),
+            "report": smart_queue.repair_state()}
+
+
+@app.post("/api/queue/watchdog")
+async def api_queue_watchdog_tick():
+    """手动触发一次看门狗巡检（自动修复仍受 watchdog_auto_heal 开关与冷却时间约束）。"""
+    result = smart_queue._watchdog_tick()
+    return {"ok": True, "result": result, "health": smart_queue.health()}
 
 
 @app.post("/api/tasks/cancel-all")
@@ -655,18 +711,55 @@ async def api_logs(lines: int = 300):
 
 @app.post("/api/cache/clear")
 async def api_clear_cache():
-    """清理临时音频缓存（wav 等中间产物）。"""
-    import shutil
+    """清理临时音频缓存（task_*.wav）。
+
+    v1.1.4: 保留正在运行任务的音频，避免手动清理打断转写；返回实际释放字节数。
+    """
     audio_dir = Path(config.DATA_DIR) / "audio"
     removed = 0
+    freed = 0
+    skipped = 0
+    running = set(getattr(smart_queue, "_running_tasks", set()))
     if audio_dir.exists():
         for f in audio_dir.glob("task_*.wav"):
             try:
+                task_id = int(f.stem[len("task_"):])
+            except ValueError:
+                task_id = None
+            if task_id in running:
+                skipped += 1
+                continue
+            try:
+                size = f.stat().st_size
                 f.unlink()
                 removed += 1
+                freed += size
             except Exception:
                 pass
-    return {"ok": True, "removed": removed}
+    return {"ok": True, "removed": removed, "freed": freed, "skipped_running": skipped}
+
+
+@app.get("/api/cache/status")
+async def api_cache_status():
+    """音频缓存现状与自动清理配置（v1.1.4）。"""
+    audio_dir = Path(config.DATA_DIR) / "audio"
+    files = 0
+    total = 0
+    if audio_dir.exists():
+        for f in audio_dir.glob("task_*.wav"):
+            try:
+                total += f.stat().st_size
+                files += 1
+            except Exception:
+                pass
+    try:
+        enabled, on_done, hours = smart_queue._audio_cache_cfg()
+    except Exception:
+        enabled, on_done, hours = True, True, 24
+    return {"ok": True, "files": files, "bytes": total,
+            "cleanup_enabled": enabled, "cleanup_on_done": on_done,
+            "retention_hours": hours,
+            "last_sweep": getattr(smart_queue, "_last_cache_sweep", {})}
 
 
 @app.post("/api/subtitles/needs-review/delete")

@@ -1,7 +1,7 @@
 services:
   subtitle-forge:
     build: .
-    image: ghcr.io/lzxssg/subtitle-forge:1.1.1
+    image: ghcr.io/lzxssg/subtitle-forge:1.1.5
     # 使用预构建镜像时：注释掉上面的 build，镜像改为
     # image: ghcr.io/lzxssg/subtitle-forge:latest
     container_name: subtitle-forge
@@ -17,10 +17,16 @@ services:
       - QUEUE_PAUSED=${QUEUE_PAUSED:-false}
       - WATCH_DIRS=${WATCH_DIRS:-/Media}
       - SCAN_INTERVAL_MINUTES=${SCAN_INTERVAL_MINUTES:-60}
+      - SCAN_INTERVAL_VALUE=${SCAN_INTERVAL_VALUE:-60}
+      - SCAN_INTERVAL_UNIT=${SCAN_INTERVAL_UNIT:-minutes}
       - TASK_WORKERS=${TASK_WORKERS:-1}
+      - TRANSCRIBE_WORKERS=${TRANSCRIBE_WORKERS:-auto}
+      - TRANSLATE_WORKERS=${TRANSLATE_WORKERS:-auto}
       - SMART_QUEUE=${SMART_QUEUE:-true}
       - MULTI_MODEL_VRAM_MB=${MULTI_MODEL_VRAM_MB:-16000}
       - HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}
+      - HF_HUB_ENABLE_HF_TRANSFER=${HF_HUB_ENABLE_HF_TRANSFER:-false}
+      - HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}
       - VIDEO_EXTS=${VIDEO_EXTS:-.mp4,.mkv,.avi,.mov,.wmv,.flv,.webm,.ts,.m2ts}
       - ASR_PROVIDER=${ASR_PROVIDER:-local}
       - ASR_MODEL=${ASR_MODEL:-small}
@@ -37,6 +43,7 @@ services:
       - REVIEW_BASE_URL=${REVIEW_BASE_URL:-}
       - REVIEW_API_KEY=${REVIEW_API_KEY:-}
       - REVIEW_MODEL=${REVIEW_MODEL:-}
+      - REVIEW_SAMPLE_COUNT=${REVIEW_SAMPLE_COUNT:-12}
       - POLISH_ENABLED=${POLISH_ENABLED:-false}
       - POLISH_BASE_URL=${POLISH_BASE_URL:-}
       - POLISH_API_KEY=${POLISH_API_KEY:-}
@@ -49,9 +56,15 @@ services:
       - SKIP_EXISTING_SUBTITLE=${SKIP_EXISTING_SUBTITLE:-true}
       - TRANSCRIPT_QUALITY_THRESHOLD=${TRANSCRIPT_QUALITY_THRESHOLD:-60}
       - TRANSLATION_QUALITY_THRESHOLD=${TRANSLATION_QUALITY_THRESHOLD:-70}
+      # 音频缓存自动清理（原始 wav 体积大，默认完成即删）
+      - AUDIO_CACHE_CLEANUP_ENABLED=${AUDIO_CACHE_CLEANUP_ENABLED:-true}
+      - AUDIO_CACHE_CLEANUP_ON_DONE=${AUDIO_CACHE_CLEANUP_ON_DONE:-true}
+      - AUDIO_CACHE_RETENTION_HOURS=${AUDIO_CACHE_RETENTION_HOURS:-24}
+      # llama-swap 集成
       - LLAMA_SWAP_CONFIG=${LLAMA_SWAP_CONFIG:-/config-llama.yaml}
       - LLAMA_MODELS_DIR=${LLAMA_MODELS_DIR:-/models-llama}
       - LLAMA_SWAP_CONTAINER=${LLAMA_SWAP_CONTAINER:-llama-swap}
+      - SAKURA_CONTAINER=${SAKURA_CONTAINER:-llama-sakura}
     volumes:
       # 媒体目录：按实际宿主路径修改，冒号右侧为容器内路径，需与 WATCH_DIRS 对应
       - ${MEDIA_ROOT:-/path/to/media}:/Media:rw

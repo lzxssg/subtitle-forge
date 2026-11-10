@@ -16,6 +16,8 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # llama-swap 中注册的全部 LLM 模型（转录阶段全部卸载，把显存让给 ASR）
 DEFAULT_SWAP_MODELS = "sakura-gpu,qwen3_8b,review-35b,35B-A3B,glm4_9b"
 
+APP_VERSION = "1.1.5"
+
 DEFAULTS = {
     "watch_dirs": os.getenv("WATCH_DIRS", "/Media"),
     "scan_interval_minutes": int(os.getenv("SCAN_INTERVAL_MINUTES", "60")),
@@ -64,6 +66,11 @@ DEFAULTS = {
     "file_stable_seconds": int(os.getenv("FILE_STABLE_SECONDS", "10")),
     "asr_language": os.getenv("ASR_LANGUAGE", "auto"),
     "translation_speed": os.getenv("TRANSLATION_SPEED", "balanced"),
+    # v1.1.4: 音频缓存自动清理——任务完成后即删除临时 task_*.wav；
+    # 失败/取消/孤儿缓存按保留时长兜底清理，避免 1.5G/天 级别的无界增长。
+    "audio_cache_cleanup_enabled": os.getenv("AUDIO_CACHE_CLEANUP_ENABLED", "true").lower() == "true",
+    "audio_cache_cleanup_on_done": os.getenv("AUDIO_CACHE_CLEANUP_ON_DONE", "true").lower() == "true",
+    "audio_cache_retention_hours": int(os.getenv("AUDIO_CACHE_RETENTION_HOURS", "24")),
     # v3 新增：运行模式 manual=手动/scheduled=定时扫描/guard=智能监控；独立校验模型
     "mode": os.getenv("MODE", "manual"),
     "queue_paused": os.getenv("QUEUE_PAUSED", "false").lower() == "true",
@@ -143,6 +150,7 @@ EDITABLE_KEYS = [
     "gpu_model_override", "gpu_vram_mb_override",
     "enhanced_transcribe_enabled", "enhanced_asr_model", "enhanced_asr_compute_type",
     "webhook_enabled", "webhook_secret", "webhook_events", "webhook_media_types", "webhook_path_map",
+    "watchdog_auto_heal", "watchdog_stuck_seconds", "watchdog_idle_seconds",
 ]
 
 # HF 国内镜像加速（模型下载走 hf-mirror.com）

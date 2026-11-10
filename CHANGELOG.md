@@ -2,6 +2,112 @@
 
 本项目的版本变更记录。版本号遵循 `MAJOR.MINOR.PATCH`。
 
+## v1.1.5（2026-11-10）
+
+修复版本：ASR 运行方式切到「llama-swap 托管」时误报「llama 托管暂无已部署模型，请先下载并部署」。
+
+### 问题
+
+- 设置页初始化（`loadConfigForm`）只渲染 ASR 托管状态，没有先拉取 `/api/models/list`，导致 `window._llamaManaged` 为空数组。
+- 此时把 ASR 运行方式切到 `llama`，前端判定所有模型都未部署：选项全部被禁用并标记「（未部署）」、ASR 模型被强制改选，最终弹出「暂无已部署模型」。
+- 后端判定实际正常：`/api/models/list` 返回 `llama_managed=['small','large-v3-turbo']`、`llama_swap_ready=true`，`config.yaml` 与 ggml 模型文件均齐备。
+
+### 修复
+
+- `loadConfigForm` 在设置 `asr_provider` 之前先 `await refreshAsrModels()`，保证 `_llamaManaged` 已就绪；异常不影响其余配置加载。
+- `APP_VERSION` 与 `VERSION` 同步为 `1.1.5`，镜像 tag 与内部版本一致。
+
+## v1.1.4（2026-11-09）
+
+维护版本：引入音频缓存自动清理，解决 `data/audio/task_*.wav` 无界增长（实测 5 天累积 150 GiB、日均 ≈30 GiB，占满存储空间 1）。
+
+### 自动清理（核心）
+
+- **任务完成即删**：任务进入 `done` 后由队列输出钩子立即删除对应 `task_{id}.wav`（`AUDIO_CACHE_CLEANUP_ON_DONE`，默认 `true`）。
+- **定期兜底巡检**：新增 `audio-cache-cleaner` 线程，启动 45s 后首扫历史积压，此后每 30 分钟巡检一次。
+  - `done` 任务：直接清理；
+  - `failed` / `cancelled` 任务：超过 `AUDIO_CACHE_RETENTION_HOURS`（默认 24h）后清理，保留排查与重试窗口；
+  - 无任务记录的孤儿缓存：超过保留期后清理；
+  - 运行中任务（`_running_tasks`）一律跳过，绝不打断正在转写的任务。
+- **手动清理接口增强**：`POST /api/cache/clear` 现在跳过运行中任务，并返回 `removed` / `freed` / `skipped_running`。
+- **新增状态接口**：`GET /api/cache/status` 返回缓存文件数、总字节、清理开关、保留时长与上次巡检结果。
+- 清理失败（文件占用/权限）仅告警，不影响任务主流程。
+
+- **版本接口**：新增 `GET /api/version` 返回 `config.APP_VERSION`；页面顶部版本号改为运行时从接口拉取，不再硬编码在 `static/index.html`，避免界面版本与镜像版本漂移。
+
+### 配置项
+
+| 键 | 环境变量 | 默认 |
+|---|---|---|
+| `audio_cache_cleanup_enabled` | `AUDIO_CACHE_CLEANUP_ENABLED` | `true` |
+| `audio_cache_cleanup_on_done` | `AUDIO_CACHE_CLEANUP_ON_DONE` | `true` |
+| `audio_cache_retention_hours` | `AUDIO_CACHE_RETENTION_HOURS` | `24` |
+
+## v1.1.3（2026-11-09）
+
+功能版本：看门狗升级为「无人值守自动修复」，不再需要人工点按钮。
+
+### 自动修复（核心）
+
+- 看门狗巡检周期固定 20s，判定分两类异常：
+  1. **任务卡死**：worker 心跳停滞超过 `watchdog_stuck_seconds`（默认 60s）且任务仍在中间态；
+  2. **队列空转**：有等待任务、无在跑任务，且完成数在 `watchdog_idle_seconds`（默认 180s）内不再增长。
+- 命中任一条件即自动执行完整修复：卸载非工作模型 → 只强杀心跳停滞的 ffmpeg → 解除批次闸门死锁 → 中间态任务归位 → 补/重建工作线程 → 重新入队续跑 → 按需预热工作模型。
+- 自动修复有 300s 冷却，避免反复打断在跑任务；正在跑的任务永不被打断（只杀「心跳停滞」或「不在运行集合」的提取进程）。
+- 每次自动修复写入日志（`看门狗：已自动修复 #N（原因）→ 终止提取 x、归位 y、续跑 z`）并通过 SSE `queue_repair` 推送前端。
+
+### 新增设置项（设置页 → 队列）
+
+- `看门狗自动修复`（`watchdog_auto_heal`，默认开启）
+- `卡死判定阈值`（`watchdog_stuck_seconds`，默认 60s，最小 15s）
+- `队列空转判定`（`watchdog_idle_seconds`，默认 180s，最小 60s）
+
+### 新增接口
+
+- `POST /api/queue/watchdog`：手动触发一次巡检（便于验证与运维），返回本次判定结果与完整健康快照
+- `GET /api/queue/repair` 的 `health` 增加 `watchdog` 段：`auto_heal`、`idle_ticks`、`auto_heal_count`、`last_auto_age_seconds`、`last_trigger`、`last_report`、`finished`
+
+### 验证（2026-11-09）
+
+- 逻辑链路测试（容器内直接调用真实 `_watchdog_tick`，repair 用替身）：① 心跳停滞 200s → 命中 stuck 并调用 `repair(force_unload=True, restart_workers=True)`，`auto_heal_count` 与 `last_report` 正确落地；② 空转场景第 3 次巡检（60s）命中并修复；③ 冷却期内不重复触发
+- 线上巡检：`health.watchdog.last_check_age_seconds` 稳定在 20s 周期内，`stuck_workers` 恒为空，任务正常推进，无误判自动修复
+- 手动触发：`POST /api/queue/watchdog` 返回 `{"ok":true,"result":{...},"health":{...}}`，空跑不产生副作用
+- 故障注入：对真实 ffmpeg 进程 SIGSTOP 后心跳年龄上涨、恢复后回落；因未持续超过阈值未触发修复（符合预期，避免误伤）
+
+### 其它
+
+- `health` 的卡死判定改用可配置阈值（不再硬编码 900s）
+- 页脚版本号 v1.1.3
+
+## v1.1.2（2026-11-09）
+
+修复版本：解决「队列空转、任务不推进」的提取死锁，并新增一键任务修复与强制卸载模型能力。
+
+### 队列假死修复（根因）
+
+- 根因：`app/pipeline/extract_audio.py` 的音频提取用 `for line in proc.stdout` 读取 ffmpeg 输出，ffmpeg 在写满管道缓冲后阻塞、Python 侧又等不到行结束，worker 线程永久卡死在读取处；队列批次已放行但无 worker 领取，表现为「进行中 0、等待中数百、任务全停在 pending」
+- 修复：ffmpeg stdout 改由独立读线程投递（`queue.Queue`），stderr 落临时文件、进程结束后统一输出；主线程按 `proc.poll()` 轮询退出码
+- 新增双超时保护：空闲超时（默认 120s 无任何输出）与总时长超时（按时长估算），超时即 `proc.kill()` 并抛错退出，不再无限等待
+- 新增取消回调：任务被取消/暂停时立即终止对应 ffmpeg 进程
+- 新增进程登记表 `ACTIVE_PROCS` 与强制终止接口 `kill_task` / `kill_all` / `kill_tasks` / `active_task_ids`
+
+### 队列看门狗
+
+- worker 心跳：每个 worker 记录当前任务、阶段与最后心跳时间（`_worker_state` / `_last_beat`），每 1.5s 刷新
+- 看门狗线程每 30s 巡检：worker 心跳停滞超过阈值（默认 900s）判定卡死并记录告警，可由修复接口一键恢复
+- `_run_loop` 增加异常兜底，单任务异常不再导致 worker 线程静默退出
+
+### 一键任务修复
+
+- 接口：新增 `POST /api/queue/repair`（执行修复并返回快照）、`GET /api/queue/repair`（只读查看当前健康状态）
+- 修复动作：① 强制卸载 llama-swap 闲置模型，把显存让给工作模型（翻译/润色在跑时只卸载非工作模型，保留 `sakura-gpu` / `glm4_9b`）；② 强杀心跳停滞的 ffmpeg（正常在跑的不动）；③ 解除批次闸门死锁、清空等候队列并重新放行；④ 中间态任务（extracting/transcribing/checking/paused）归位为 pending 重排；⑤ 重建或补充工作线程（有任务在跑时只补线程、不打断）；⑥ 预热目标模型后立即放行新批次
+- `POST /api/queue/pause` 恢复队列时支持 `force_unload`，恢复前先卸载闲置模型
+- 前端：工具栏新增「任务修复」按钮，二次确认后调用修复接口并以 toast/日志展示卸载模型、终止进程、归位任务、当前批次等明细；恢复队列时自动携带强制卸载参数
+
+### 其他
+
+- 页脚版本号更新为 v1.1.2
+
 ## v1.1.1（2026-11-06）
 
 修订版本：增强转录流程产出的字幕不再被视为失败，直接保留在视频原目录。
