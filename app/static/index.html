@@ -446,7 +446,7 @@ button.small.active { background: var(--accent); color: #fff; }
 
     <!-- 翻译 API -->
     <div id="tab-llm" class="tab-panel">
-      <div class="form-row"><label>API 地址 (Base URL)</label><input type="text" id="cfg_llm_base_url" placeholder="https://api.deepseek.com/v1 或 http://127.0.0.1:11434/v1" onchange="refreshLlms('llm')"><div class="form-hint">支持任意 OpenAI 兼容接口：DeepSeek / Ollama / Sakura / 硅基流动 等</div></div>
+      <div class="form-row"><label>API 地址 (Base URL)</label><input type="text" id="cfg_llm_base_url" placeholder="https://api.deepseek.com/v1 或 http://127.0.0.1:11435/v1" onchange="refreshLlms('llm')"><div class="form-hint">支持任意 OpenAI 兼容接口：DeepSeek / Ollama / Sakura / 硅基流动 等</div></div>
       <div class="form-row"><label>API Key</label><input type="password" id="cfg_llm_api_key" placeholder="本地模型可留空"></div>
       <div class="form-row"><label>翻译模型</label><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="display:flex;gap:6px"><select id="cfg_llm_model" style="flex:1" onchange="onModelSelectChange('cfg_llm_model')"></select><button type="button" class="mini-btn" onclick="refreshLlms('llm')">刷新</button><button type="button" class="mini-btn" onclick="testLlm('llm')">测试</button></div><input type="text" id="cfg_llm_model_custom" placeholder="手动填写模型名" style="display:none" onchange="onModelCustomInput('cfg_llm_model')"></div><div class="form-hint" id="llm_test_result">填写 API 地址后点「刷新」拉取可选模型；云端不支持拉取时可选「手动输入…」</div></div>
       <div class="form-row"><label>翻译温度</label><input type="number" id="cfg_llm_temperature" step="0.1" min="0" max="2"></div>
@@ -653,7 +653,8 @@ fetch('/api/version', {cache: 'no-store'}).then(r => r.json()).then(d => {
 }).catch(() => {});
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = n => n == null ? '-' : (typeof n === 'number' ? (Math.round(n*10)/10) : n);
-const STAGE_NAMES = { pending:'排队中', paused:'已暂停', extracting:'提取音频', transcribing:'语音转录', checking:'转录质检', transcribed:'待翻译', translating:'AI 翻译', checking_translation:'翻译校对', polishing:'字幕润色', done:'完成', failed:'失败', cancelled:'已取消', skipped:'已跳过' };
+// v1.1.14：补 translated / reviewed 两个 sync 中间态文案，避免界面直接显示英文状态名
+const STAGE_NAMES = { pending:'排队中', paused:'已暂停', extracting:'提取音频', transcribing:'语音转录', checking:'转录质检', transcribed:'待翻译', translating:'AI 翻译', translated:'待校对', checking_translation:'翻译校对', reviewed:'待润色', polishing:'字幕润色', done:'完成', failed:'失败', cancelled:'已取消', skipped:'已跳过' };
 const STAGE_COLORS = { pending:'var(--accent)', paused:'var(--muted)', extracting:'var(--yellow)', transcribing:'var(--yellow)', checking:'var(--yellow)', transcribed:'var(--accent)', translating:'var(--yellow)', translated:'var(--accent)', checking_translation:'var(--yellow)', reviewed:'var(--purple)', polishing:'var(--purple)', done:'var(--green)', failed:'var(--red)', cancelled:'var(--muted)', skipped:'var(--muted)' };
 
 // ---------- 图表 ----------
@@ -1474,7 +1475,7 @@ function taskCard(t) {
     ops.push(`<button class="small" onclick="retryTask(${t.id}, true)" title="用设置里的增强转录模型（如 large-v3）重新转录该视频，覆盖现有字幕">增强重试</button>`);
     ops.push(`<button class="small danger" onclick="delTaskSubtitles(${t.id})" title="删除该任务生成的转录/译文/润色字幕文件，任务记录保留">删除字幕</button>`);
   }
-  if (['pending','extracting','transcribing','checking','transcribed','translating','checking_translation','polishing'].includes(st)) ops.push(`<button class="small" onclick="cancelTask(${t.id})">取消</button>`);
+  if (['pending','extracting','transcribing','checking','transcribed','translating','translated','checking_translation','reviewed','polishing'].includes(st)) ops.push(`<button class="small" onclick="cancelTask(${t.id})">取消</button>`);
   if (st === 'paused') ops.push(`<button class="small" onclick="resumeTask(${t.id})">恢复</button>`);
   ops.push(`<button class="small danger" onclick="delTask(${t.id})">删除记录</button>`);
   // 实时速率：转录显示每秒转录秒数（xRT），翻译/校对/润色显示全局 token 吞吐；
@@ -1533,6 +1534,7 @@ function renderTaskStats() {
     if (el) {
       const q = (batchState && typeof batchState.waiting === 'number') ? batchState.waiting : null;
       el.title = '排队中 ' + (s.waiting_pending || 0) + ' + 待翻译 ' + (s.waiting_transcribed || 0)
+        + ' + 待校对 ' + (s.waiting_translated || 0) + ' + 待润色 ' + (s.waiting_reviewed || 0)
         + (q != null ? '（调度队列 ' + q + '）' : '');
     }
     const tt = $('statTotal');

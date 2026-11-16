@@ -1,7 +1,7 @@
 services:
   subtitle-forge:
     build: .
-    image: subtitle-forge:1.1.13
+    image: subtitle-forge:1.1.14
     container_name: subtitle-forge
     restart: unless-stopped
     ports:

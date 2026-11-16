@@ -2,6 +2,16 @@
 
 本项目的版本变更记录。版本号遵循 `MAJOR.MINOR.PATCH`。
 
+## v1.1.14（修复）
+
+任务列表状态标识中英混排：`translated` / `reviewed` 两个 sync 中间态在 `STAGE_NAMES` 里没有中文文案，前端回退显示原始状态名。
+
+### 修复
+
+- `STAGE_NAMES` 补 `translated:'待校对'`、`reviewed:'待润色'`，状态标识全中文。
+- 任务操作按钮的「取消」由状态白名单驱动，白名单同步加入 `translated` / `reviewed`，中间态任务可正常取消。
+- 「等候中」悬停提示改为四段口径：排队中 + 待翻译 + 待校对 + 待润色（与 v1.1.13 的 `waiting` 聚合口径一致）。
+
 ## v1.1.13（2026-11-16）
 
 首页统计 500 修复：`/api/stats` 抛 `IndexError: No item with that key`，导致首页所有统计卡显示「–」、任务页计数全 0。
