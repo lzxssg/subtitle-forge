@@ -28,6 +28,40 @@ def is_video_file(path: str, exts: str) -> bool:
     return ext in [e.strip().lower() for e in exts.split(",") if e.strip()]
 
 
+def max_video_minutes() -> int:
+    """视频时长上限（分钟）；0 或非法值表示不限制。"""
+    try:
+        return max(0, int(db.get_setting("max_video_minutes") or 0))
+    except Exception:
+        return 0
+
+
+def duration_seconds(video_path: str) -> float:
+    """ffprobe 读取视频时长（秒），失败返回 0（延迟导入避免与 pipeline 循环依赖）。"""
+    try:
+        from .pipeline.extract_audio import probe_duration
+        return float(probe_duration(video_path) or 0.0)
+    except Exception:
+        return 0.0
+
+
+def duration_exceeded(video_path: str, limit_minutes: int = None):
+    """判断视频是否超过时长上限，返回 (是否超限, 时长秒数)。
+
+    v1.1.7：默认上限取设置 max_video_minutes（默认 240 分钟，0 = 不限制）。
+    上限为 0 时不探测、直接放行；探测失败（返回 0）同样放行，避免因 ffprobe
+    异常把正常视频挡在队列外。
+    """
+    limit = max_video_minutes() if limit_minutes is None else max(0, int(limit_minutes))
+    if limit <= 0:
+        return False, 0.0
+    dur = duration_seconds(video_path)
+    if dur <= 0:
+        return False, 0.0
+    return (dur > limit * 60), dur
+
+
+
 _SUB_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".sub")
 
 
@@ -67,6 +101,8 @@ def classify_video(video_path: str, dir_cache: dict = None):
     - ("full", "")          ：无任何字幕 → 完整流水线（转录→质检→翻译→质检）
     """
     if not is_video_file(video_path, db.get_setting("video_exts")):
+        if Path(video_path).suffix.lower() in OTHER_VIDEO_EXTS:
+            return ("skip", "不支持的视频格式")
         return ("skip", "非视频文件")
     name = Path(video_path).name
     if name.startswith(".") or ".part" in name or name.endswith(".download"):
@@ -83,6 +119,41 @@ def classify_video(video_path: str, dir_cache: dict = None):
     # 有非中文字幕 → 只翻译
     src = subs[0].name
     return ("translate_only", f"已有外文字幕 {src}")
+
+
+def count_existing_subtitles(dirs=None, cancel_cb=None):
+    """v1.1.8：轻量统计媒体库「已有中文字幕」的视频数。
+
+    只做文件名匹配（不查库、不 ffprobe），用于首页「已有字幕」统计的兜底刷新。
+    返回 (existing, videos)。
+    """
+    if dirs is None:
+        dirs = [d.strip() for d in str(db.get_setting("watch_dirs")).split(",") if d.strip()]
+    ext_set = {e.strip().lower() for e in str(db.get_setting("video_exts")).split(",") if e.strip()}
+    dir_cache = {}
+    existing = videos = unsupported = 0
+    for d in dirs:
+        root = Path(d)
+        if not root.exists():
+            continue
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if cancel_cb is not None and cancel_cb():
+                dir_cache.clear()
+                LAST_SCAN_SKIP["unsupported"] = unsupported
+                return existing, videos
+            for fname in filenames:
+                _sfx = Path(fname).suffix.lower()
+                if _sfx not in ext_set:
+                    if _sfx in OTHER_VIDEO_EXTS:
+                        LAST_SCAN_SKIP["unsupported"] += 1
+                    continue
+                videos += 1
+                action, reason = classify_video(os.path.join(dirpath, fname), dir_cache)
+                if action == "skip" and str(reason).startswith("已存在中文字幕"):
+                    existing += 1
+    dir_cache.clear()
+    LAST_SCAN_SKIP["unsupported"] = unsupported
+    return existing, videos
 
 
 def should_skip(video_path: str, dir_cache: dict = None, active_paths=None) -> bool:
@@ -217,32 +288,132 @@ class DirectoryWatcher:
             self.observer.join(timeout=5)
 
 
-def scan_dirs(force=False):
-    """全量扫描监控目录，把新视频入队。返回新增数量。"""
+# v1.1.8：扫描跳过明细（进程级，由 main 在每次扫描开始前 reset、结束后落盘）
+# v1.1.9：常见但未被 video_exts 白名单覆盖的容器/编码，扫描时计入「不支持」
+OTHER_VIDEO_EXTS = {
+    ".rmvb", ".rm", ".vob", ".m4v", ".3gp", ".3g2", ".asf", ".mpg", ".mpeg",
+    ".f4v", ".ogv", ".mts", ".m2v", ".dv", ".wtv", ".divx", ".xvid", ".avs",
+    ".ra", ".ram", ".dat", ".bik", ".amv", ".mtv",
+}
+LAST_SCAN_SKIP = {"existing": 0, "duration": 0, "active": 0, "unsupported": 0}
+
+
+def reset_scan_skip():
+    for k in LAST_SCAN_SKIP:
+        LAST_SCAN_SKIP[k] = 0
+
+
+def scan_dirs(force=False, cancel_cb=None, on_progress=None, dirs=None, stats=None):
+    """全量扫描监控目录，把新视频入队。返回新增数量。
+
+    v1.1.6：支持取消与进度上报——
+    - cancel_cb() 返回 True 时立即停止遍历（已入队的任务保留，由调用方决定是否清理）；
+    - on_progress(processed, added, current_path) 每处理一个目录 / 每 200 个文件回调一次；
+      v1.1.7 起每 200 个文件额外附加 stats 快照供前端展示超长跳过数。
+    - dirs 显式传入时只扫这些目录（默认取 watch_dirs 设置）。
+    - stats 传入字典时回填统计：skipped_duration（超长跳过数）、limit_minutes（生效上限）。
+    """
     from .queue_manager import enqueue_path
     # 手动模式禁止自动扫描（用户手动触发时 force=True 除外）
     if not force and config.get_setting("mode", "manual") == "manual":
         logger.info("手动模式不自动扫描，跳过 scan_dirs")
         return 0
-    dirs = [d.strip() for d in str(db.get_setting("watch_dirs")).split(",") if d.strip()]
+    if dirs is None:
+        dirs = [d.strip() for d in str(db.get_setting("watch_dirs")).split(",") if d.strip()]
     ext_set = {e.strip().lower() for e in str(db.get_setting("video_exts")).split(",") if e.strip()}
     active_paths = db.active_task_paths()   # 一次查全，扫描时内存判断
     dir_cache = {}                          # 目录列表缓存，避免同目录重复 listdir
+    limit_minutes = max_video_minutes()     # v1.1.7：视频时长上限（0=不限制）
+    skipped_duration = 0
     added = 0
+    processed = 0
+    cancelled = False
+
+    def _stats():
+        if stats is not None:
+            stats["skipped_duration"] = skipped_duration
+            stats["limit_minutes"] = limit_minutes
+
+    _stats()
+
+    def _cancelled():
+        if cancel_cb is None:
+            return False
+        try:
+            return bool(cancel_cb())
+        except Exception:
+            return False
+
     for d in dirs:
         root = Path(d)
         if not root.exists():
             continue
+        # v1.1.6：扫描过程中用户移除了监控目录（取消勾选/删除），
+        # 尚未开始遍历的目录立即跳过，不再入队 —— 旧实现在扫描启动时就固定了目录快照
+        try:
+            live = {x.strip().rstrip("/") for x in
+                    str(db.get_setting("watch_dirs")).split(",") if x.strip()}
+            if live and str(d).strip().rstrip("/") not in live:
+                logger.info("扫描跳过已移除的监控目录: %s", d)
+                continue
+        except Exception:
+            pass
         for dirpath, _dirnames, filenames in os.walk(root):
+            if _cancelled():
+                cancelled = True
+                break
             for fname in filenames:
+                processed += 1
+                if processed % 200 == 0:
+                    if _cancelled():
+                        cancelled = True
+                        break
+                    if on_progress:
+                        on_progress(processed, added, os.path.join(dirpath, fname))
+                _sfx = Path(fname).suffix.lower()
+                if _sfx not in ext_set:
+                    if _sfx in OTHER_VIDEO_EXTS:
+                        LAST_SCAN_SKIP["unsupported"] += 1
+                    continue
                 full = os.path.join(dirpath, fname)
-                if Path(fname).suffix.lower() not in ext_set:
+                # v1.1.8：区分跳过原因 —— 已有中文字幕单独计数用于「已有字幕」统计
+                action, reason = classify_video(full, dir_cache)
+                if action == "skip":
+                    if str(reason).startswith("已存在中文字幕"):
+                        LAST_SCAN_SKIP["existing"] += 1
+                    _stats()
                     continue
-                if should_skip(full, dir_cache, active_paths):
+                if active_paths is not None:
+                    if full in active_paths:
+                        LAST_SCAN_SKIP["active"] += 1
+                        continue
+                elif db.get_task_by_path(full, active_only=True):
+                    LAST_SCAN_SKIP["active"] += 1
                     continue
-                enqueue_path(full, source="scan")
-                added += 1
+                # v1.1.7：超过时长上限的视频不进入队列
+                over, dur = duration_exceeded(full, limit_minutes)
+                if over:
+                    skipped_duration += 1
+                    LAST_SCAN_SKIP["duration"] += 1
+                    logger.info("跳过超长视频（%.0f 分钟 > %s 分钟上限）: %s",
+                                dur / 60.0, limit_minutes, full)
+                    _stats()
+                    continue
+                if enqueue_path(full, source="scan",
+                                duration=(dur if limit_minutes > 0 else None),
+                                limit_minutes=limit_minutes):
+                    added += 1
+                _stats()
+            if on_progress:
+                on_progress(processed, added, dirpath)
+            if cancelled:
+                break
+        if cancelled:
+            break
     dir_cache.clear()
+    if cancelled:
+        logger.info("扫描已被取消：已检查 %s 个文件，入队 %s 个", processed, added)
+        return added
     # 失败任务自动重试（每轮扫描最多重试一轮，限制次数防死循环）
     if db.get_setting("auto_retry_failed"):
         from .queue_manager import smart_queue

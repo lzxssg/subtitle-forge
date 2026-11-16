@@ -220,16 +220,16 @@ def count_tasks():
 
 # 任务列表视图与状态的映射（服务端分页/搜索用）
 VIEW_STATUS_SQL = {
-    "all": "status IN ('pending','transcribed','paused')",
+    "all": "status IN ('pending','transcribed','translated','reviewed','paused')",
     "cur": ("status IN ('pending','extracting','transcribing','checking','transcribed',"
-            "'translating','checking_translation','polishing','paused')"),
+            "'translating','translated','checking_translation','reviewed','polishing','paused')"),
     "done": "status = 'done'",
     "failed": "status = 'failed'",
     "review": "EXISTS (SELECT 1 FROM subtitles s WHERE s.task_id=tasks.id AND s.status='needs_review')",
     "transcribe": "status IN ('pending','extracting','transcribing')",
-    "check": "status IN ('checking','checking_translation')",
-    "translate": "status IN ('translating','transcribed')",
-    "polish": "status = 'polishing'",
+    "check": "status IN ('checking','checking_translation','translated')",
+    "translate": "status IN ('translating','transcribed','translated')",
+    "polish": "status IN ('polishing','reviewed')",
     "history": "status IN ('done','failed','cancelled','skipped')",
 }
 
@@ -363,25 +363,81 @@ def task_stats():
     单条聚合查询取代原先 8 次 COUNT(*) 全表扫描。
     """
     now = time.time()
-    day_start = time.mktime(time.localtime(now)[:3] + (0, 0, 0) + (-1, -1, -1))
+    # v1.1.8：今日统计窗口固定为本地当天 00:00:00 ~ 次日 00:00:00（一整天 24 小时）
+    lt = time.localtime(now)
+    day_start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+    day_end = day_start + 86400
     with db() as conn:
         r = conn.execute(
-            "SELECT COUNT(*) AS total,"
-            " SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END) AS today,"
-            " SUM(CASE WHEN status='done' AND created_at >= ? THEN 1 ELSE 0 END) AS today_done,"
+            "SELECT SUM(CASE WHEN status!='cancelled' THEN 1 ELSE 0 END) AS total,"
+            " SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END) AS today,"
+            " SUM(CASE WHEN status='done' AND updated_at >= ? AND updated_at < ? THEN 1 ELSE 0 END) AS today_done,"
             " SUM(CASE WHEN status IN ('pending','extracting','transcribing','checking','translating','checking_translation') THEN 1 ELSE 0 END) AS active,"
             " SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done,"
             " SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,"
             " SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END) AS cancelled,"
-            " SUM(CASE WHEN status='done' AND (stage='skipped' OR error LIKE '%跳过%') THEN 1 ELSE 0 END) AS skipped,"
-            " SUM(CASE WHEN status='failed' AND error LIKE '%不支持%' THEN 1 ELSE 0 END) AS unsupported,"
-            " SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS waiting,"
+            " SUM(CASE WHEN status='done' AND (stage='skipped' OR error LIKE '%跳过%') THEN 1 ELSE 0 END) AS skipped_hint,"
+            " SUM(CASE WHEN status='failed' AND ("
+            "   error LIKE '%不支持%' OR error LIKE '%无法解析%' OR error LIKE '%Invalid data%'"
+            "   OR error LIKE '%提取音频失败%' OR error LIKE '%no audio%' OR error LIKE '%没有音频%')"
+            " THEN 1 ELSE 0 END) AS unsupported,"
+            # v1.1.13：sync 模式新增 translated/reviewed 中间态，等候口径必须同步纳入，
+            # 否则 SUM 结果里取不到 waiting_translated/waiting_reviewed 会抛 IndexError（/api/stats 500）
+            " SUM(CASE WHEN status IN ('pending','transcribed','translated','reviewed') THEN 1 ELSE 0 END) AS waiting,"
+            " SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS waiting_pending,"
+            " SUM(CASE WHEN status='transcribed' THEN 1 ELSE 0 END) AS waiting_transcribed,"
+            " SUM(CASE WHEN status='translated' THEN 1 ELSE 0 END) AS waiting_translated,"
+            " SUM(CASE WHEN status='reviewed' THEN 1 ELSE 0 END) AS waiting_reviewed,"
             " SUM(CASE WHEN status IN ('extracting','transcribing','checking','translating','checking_translation','polishing') THEN 1 ELSE 0 END) AS running,"
             " SUM(CASE WHEN EXISTS (SELECT 1 FROM subtitles s WHERE s.task_id=tasks.id AND s.status='needs_review') THEN 1 ELSE 0 END) AS review"
-            " FROM tasks", (day_start, day_start)).fetchone()
+            " FROM tasks", (day_start, day_end, day_start, day_end)).fetchone()
     keys = ("total", "today", "today_done", "active", "done",
-            "failed", "cancelled", "skipped", "unsupported", "waiting", "running", "review")
-    return {k: int(r[k] or 0) for k in keys}
+            "failed", "cancelled", "unsupported", "waiting", "waiting_pending",
+            "waiting_transcribed", "waiting_translated", "waiting_reviewed",
+            "running", "review")
+    # v1.1.13：聚合结果缺失字段时按 0 处理，避免 SQL 与 keys 不同步导致 /api/stats 直接 500
+    _rk = set(r.keys())
+    out = {k: (int(r[k] or 0) if k in _rk else 0) for k in keys}
+    # v1.1.10：等待口径统一为库内状态（pending + transcribed），并给出自检差额，
+    # 避免「等候中」用内存调度队列数而与「总任务数」等库内计数对不上。
+    out["other"] = max(0, out["total"] - out["waiting"] - out["running"]
+                       - out["done"] - out["failed"])
+    # v1.1.8：「已有字幕」= 最近一次扫描发现已有字幕而跳过的视频数（任务表不会收录这些视频，
+    # 原先用 stage='skipped' 统计恒为 0）；同时保留任务级跳过数作为补充。
+    try:
+        scan_existing = int(get_setting("scan_existing_count") or 0)
+    except Exception:
+        scan_existing = 0
+    try:
+        scan_last_at = float(get_setting("scan_last_at") or 0)
+    except Exception:
+        scan_last_at = 0.0
+    # v1.1.9：「不支持」= 任务级失败（格式/编码不支持）+ 最近一次扫描发现的非白名单视频容器，
+    # 原口径仅统计 error 含「不支持」，而该文案从不写入，故恒为 0（死指标）。
+    try:
+        scan_unsupported = int(get_setting("scan_unsupported_count") or 0)
+    except Exception:
+        scan_unsupported = 0
+    out["task_unsupported"] = out["unsupported"]
+    out["scan_unsupported"] = scan_unsupported
+    out["unsupported"] = max(out["unsupported"], scan_unsupported)
+    out["scan_existing"] = scan_existing
+    out["scan_last_at"] = scan_last_at
+    out["skipped"] = max(scan_existing, int(r["skipped_hint"] or 0))
+    # v1.1.8：今日 00:00~24:00 每小时完成数（24 个桶），供首页「今日生成」时段分布展示
+    hourly = [0] * 24
+    with db() as conn:
+        for row in conn.execute(
+                "SELECT updated_at FROM tasks WHERE status='done'"
+                " AND updated_at >= ? AND updated_at < ?", (day_start, day_end)):
+            try:
+                h = time.localtime(float(row[0])).tm_hour
+            except Exception:
+                continue
+            hourly[h] += 1
+    out["today_hourly"] = hourly
+    out["day_start"] = int(day_start)
+    return out
 
 
 def list_failed_tasks(limit=200):

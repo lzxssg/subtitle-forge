@@ -2,6 +2,158 @@
 
 本项目的版本变更记录。版本号遵循 `MAJOR.MINOR.PATCH`。
 
+## v1.1.13（2026-11-16）
+
+首页统计 500 修复：`/api/stats` 抛 `IndexError: No item with that key`，导致首页所有统计卡显示「–」、任务页计数全 0。
+
+### 修复
+
+- `database.task_stats()`：聚合 SQL 补上 `waiting_translated` / `waiting_reviewed` 两个字段（v1.1.11 引入 sync 中间态时只加了 keys 没加 SQL），并把「等候中」口径修正为 `pending + transcribed + translated + reviewed`。
+- `database.task_stats()`：结果取值改为缺失字段按 0 兜底（`k in r.keys()`），避免 SQL 与 keys 再次不同步时整站统计直接 500。
+
+### 实测
+
+- 修复前：`GET /api/stats` → 500 `IndexError: No item with that key`（database.py:394），首页统计卡全「–」。
+- 修复后：`/api/stats` 200，total/waiting/done/failed 等字段齐全，首页卡片与任务页计数恢复。
+
+## v1.1.12（2026-11-16）
+
+批次完整性修复：避免看门狗误判把批次切碎成 1~2 个成员，保证 20 个任务真正整批同步推进。
+
+### 修复
+
+- **看门狗误判长批次**：`watchdog_stuck_seconds` 默认值 60s → 300s（下限 15s → 120s），`watchdog_idle_seconds` 默认 180s → 300s（下限 60s → 120s）。翻译/校对/润色是「整批提交、整批等待」，单批 200 条最长需 1~2 分钟，原阈值会把正常批次判成卡死并触发 repair。
+- **repair 切碎批次**：`repair()` 解除批次死锁时改为保留本批所有活动成员（含 `transcribed/translated/reviewed` 中间态），不再缩成「正在跑的 1~2 个」。
+- **批次不会补满**：`_admit_batch()` 在批次处于转录阶段（成员全为待转录/转录中）时按 `batch_size` 补满名额；一旦有成员进入阶段中间态或翻译/校对/润色中，批次立即锁死不再补人，保证整批阶段同步、杜绝跨阶段混跑。
+
+### 实测
+
+- 修复前：看门狗在 14:16 因「任务无进度超过 60s」触发 repair，批次从 20 缩到 2，日志出现 `批次状态 {'translated': 2}`，20 阶段同步退化为 2 个任务同步。
+- 修复后：批次维持 20 个成员，阶段闸门日志显示整批推进（`translate → review`、`review → polish`），无跨阶段混跑。
+
+## v1.1.11（2026-11-16）
+
+阶段同步调度版：新增 `sync` 调度模式，整批任务按「转录 → 翻译 → 校对 → 润色」四阶段集体推进，
+杜绝「单个任务把大模型来回切换、跑完全流程才排下一个」。
+
+### 新增：sync 批内阶段同步调度
+
+- `queue_manager.py` 新增 `_sync_stage_of()` / `_sync_checkpoint()`：按批次状态分布推断当前阶段，上一环节还有任务在跑就锁死本阶段，整批到边界才一次性提交下一阶段。
+- 阶段推进链：`pending/transcribing` → 转录；整批 `transcribed` → 翻译；整批 `translated` → 校对；整批 `reviewed` → 润色。
+- 新增 `_review_stage()`（翻译质检，落 `translated`）、`_polish_stage()`（润色，落 `done`）、`_load_translated_srt()`（从磁盘还原译文）。
+- 新增 `translated` / `reviewed` 阶段中间态，并纳入 `BATCH_ACTIVE_STATUSES`（仍占批次名额）。
+- 阶段切换由 `_sync_prepare()` 只预热一次目标模型；转录阶段自动卸载 LLM 让位给 ASR。
+- 混跑防护：`_sync_stage_of()` 12 例纯逻辑单测全通过，确保不会出现「有的任务已校对、有的还在翻译」。
+
+### 配套改动
+
+- `database.py`：`waiting` 口径扩展为 `pending + transcribed + translated + reviewed`，新增 `waiting_translated` / `waiting_reviewed` 自检字段；任务视图 `all` / `cur` / `check` / `translate` / `polish` 纳入两个新中间态。
+- `main.py`：启动恢复时 sync 中间态原样入队续跑；暂停放开到中间态，恢复时回到暂停前阶段（`meta.paused_from`），避免被重置为 `pending` 重跑转录。
+- 前端：新增「sync」调度模式选项；状态名与配色补充「待校对」「待润色」；首页「等待队列」悬停明细含四阶段待跑数。
+- 默认行为：`scheduler_mode=auto` 在显存不足以多模型共存时解析为 `sync`（RTX 5060 8G 属单模型场景）。
+
+## v1.1.10（2026-11-16）
+
+统计自洽版：修复首页队列统计「各项之和对不上总任务数」的口径缺陷。
+
+### 修复：等候中与总任务数对不上
+
+- 根因一：「等候中」取自调度器内存队列 `batchState.waiting`（只含本次运行已入队的任务），而「总任务数 / 已完成 / 失败 / 进行中」取自数据库全量统计，两者口径不同。
+- 根因二：`transcribed`（已转录、待翻译）这一中间态没被任何卡片统计，成为「消失的任务」；`stats.waiting` 原来只算 `pending`。
+- 实测差额：2942 −（1 + 1375 + 1473 + 47）= 46，其中 27 条为 `transcribed`，19 条为库内 `pending` 但未进入调度队列。
+- 修复：`database.py: task_stats()` 的 `waiting` 改为 `pending + transcribed`，并新增 `waiting_pending` / `waiting_transcribed` / `other`（自检差额）字段。
+- 前端：「等候中」改用库内口径 `s.waiting`，调度队列数降级为鼠标悬停提示；「总任务数」悬停显示 `等候 + 进行中 + 已完成 + 失败 = 总数` 的自洽算式。
+- 首页「等待队列」原为 `waiting + active` 重复计数（`active` 已含 `pending`），改为只取 `waiting`，副标题改为「排队中 + 待翻译」。
+
+## v1.1.9（2026-11-16）
+
+统计口径修正版：「累计生成」不再把已取消任务计入；「不支持」从恒为 0 的死指标改为真实可产出的指标。
+
+### 修复：累计生成排除已取消任务
+
+- `database.py: task_stats()` 的 `total` 由 `COUNT(*)` 改为 `SUM(CASE WHEN status!='cancelled' THEN 1 ELSE 0 END)`。
+- 实测 7371（含 4429 条 cancelled）→ 2942，只统计实际进入处理流程的任务。
+- 首页卡片副标题由「全部任务数」改为「不含已取消」，避免口径误读。
+
+### 修复：不支持统计恒为 0（死指标）
+
+- 根因：原口径为 `status='failed' AND error LIKE '%不支持%'`，但全项目没有任何一处写入「不支持」字样，
+  格式不支持的视频在扫描阶段就按 `video_exts` 白名单过滤掉、从不建任务，因此该值永远为 0 —— 不是故障，但属于无效指标。
+- `watcher.py` 新增 `OTHER_VIDEO_EXTS`（`.rmvb/.rm/.vob/.m4v/.3gp/.asf/.mpg/.mpeg/.f4v/.ogv/...` 等常见但不在白名单的容器），
+  全量扫描与「已有字幕」轻量重算时逐文件计数，计入 `LAST_SCAN_SKIP["unsupported"]`；`classify_video` 对这类文件返回
+  「不支持的视频格式」而非「非视频文件」。
+- `main.py` 在扫描结束与统计刷新时把该计数落盘为 `scan_unsupported_count`。
+- `database.py: task_stats()` 的 `unsupported` 改为两部分取大：任务级 `failed` 且错误属格式/编码不支持
+  （`不支持 / 无法解析 / Invalid data / 提取音频失败 / no audio / 没有音频`）+ 扫描级 `scan_unsupported_count`；
+  同时新增 `task_unsupported` / `scan_unsupported` 两个分项字段便于排查。
+- 实测：`unsupported=2`（MIGD-510.mp4、STAR-456-C.mp4，AAC 音轨损坏导致 ffmpeg 解码失败）；
+  当前媒体库 2858 个视频中非白名单容器 0 个，故 `scan_unsupported=0`。
+- 首页副标题改为「格式/编码不支持」。
+
+### 其它
+
+- `APP_VERSION` / `VERSION` / 运行目录 `docker-compose.yml` 镜像 tag → `1.1.9`。
+
+## v1.1.8（2026-11-16，补记）
+
+- 「今日生成」改按完成时间（`updated_at`）统计本地当天 00:00–24:00，新增 24 小时时段分布柱状条。
+- 新增「已有字幕」统计：扫描时单独计数 `scan_existing_count` 落盘，并支持手动 / 启动后超 12 小时自动重算
+  （`POST /api/stats/existing/refresh`）。
+
+## v1.1.7（2026-11-15）
+
+功能版本：新增「最长视频时长」过滤（默认 240 分钟），并让「恢复队列」默认接入任务修复。
+
+### 新增：最长视频时长过滤
+
+- 新增设置项 `max_video_minutes`（`MAX_VIDEO_MINUTES`，默认 `240`，区间 `0~2880`，`0` = 不限制）：
+  超过上限的视频不再进入任务队列，避免整部超长素材（演唱会 / 直播回放 / 课程合集）占用 GPU 数小时。
+- `watcher.py` 新增 `max_video_minutes()` / `duration_seconds()` / `duration_exceeded()`：
+  ffprobe 探测时长，探测失败（返回 0）时放行，不因探测异常把正常视频挡在队列外。
+- 全量扫描 `scan_dirs`：逐文件判定，超长计入 `skipped_duration`，扫描进度面板显示「超长排除 >N 分钟」。
+- 一键转录 / 一键翻译：同样在入队前判定，超长写入日志并计入跳过数，任务 meta 记录 `duration`。
+- 一键润色：由字幕反查同目录原视频（`_video_of_subtitle`）后判定，无法反查时放行。
+- 手动添加（`/api/tasks`）：单文件超长直接返回明确错误；目录添加返回 `skipped_duration` 与 `limit_minutes`。
+- 设置页新增「最长视频时长」输入框（默认 240），保存时夹取 `0~2880`。
+
+### 变更：恢复队列默认接入任务修复
+
+- `resume_all(force_unload=True)`：恢复队列默认走一次 `repair`（卸载无任务的闲置大模型 → 强杀卡住的提取进程 →
+  解除批次闸门死锁 → 中间态归位 → 重建工作线程 → 重新入队并预热工作模型），而不是单纯把 `paused` 改回 `pending`。
+- `POST /api/queue/pause` 的 `force_unload` 默认改为 `true`，响应带回 `repaired` 与最近一次修复快照；
+  只想纯放行时显式传 `force_unload=false`。
+- 前端「恢复队列」按钮与独立 `resumeQueue()` 统一走修复路径，提示文案展示卸载/终止等修复动作详情。
+- `APP_VERSION` / `VERSION` / 镜像 tag 同步为 `1.1.7`。
+
+## v1.1.6（2026-11-14）
+
+修复：扫描任务无法取消 —— 误点「扫描全部 / 一键转录 / 一键翻译 / 一键润色」后只能等它扫完，
+取消监控目录勾选也不起作用，且清空任务后又被扫描器重新塞满。
+
+### 问题
+
+- 四个扫描入口都是同步遍历，前端只 toast 一句，没有任何进度和取消入口；页面刷新后彻底失联。
+- 扫描启动时固定了目录快照，扫描过程中移除监控目录（取消勾选）不会影响已在跑的遍历。
+- `scan_polish_jobs` / `scan_transcribe_jobs` / `scan_translate_jobs` 用 `sorted(rglob(...))`
+  先全量枚举再排序，大目录既慢又让取消点失效。
+- 「清空记录」只清数据库，扫描线程仍在往队列塞任务，清完立刻又满。
+
+### 修复
+
+- 新增 `app/scan_control.py`：进程级 `ScanController`，登记扫描任务、上报进度、支持取消；
+  同一时间只允许一个扫描在跑，避免重复遍历同一批目录。
+- `watcher.scan_dirs` 与 `queue_manager.scan_*_jobs` 全部支持 `cancel_cb` + `on_progress`：
+  每 200 / 100 个文件与每个目录轮询一次取消标记，触发即停止并返回已入队数量。
+- 去掉 `sorted(rglob(...))`，改为惰性遍历，保证大目录下取消能及时生效。
+- 扫描过程中每个顶层目录开始前重新读取监控目录列表，已被移除的目录立即跳过。
+- 四个扫描接口改为后台线程执行，立即返回 `job_id`；新增：
+  - `GET /api/scan/status` 运行中进度 + 最近一次结果；
+  - `POST /api/scan/cancel` 取消扫描，`purge` 可连带清理本次扫描入队且尚未开始的任务。
+- `SmartQueue.clear_pending(sources, delete)`：按来源清理未开始的任务（默认标记 cancelled，可选用删除）。
+- `/api/tasks/cancel-all`、`/api/tasks/clear-all` 默认先取消扫描再清任务，避免清完又被塞满。
+- 前端新增扫描面板：实时进度（已检查/入队/跳过/当前路径/耗时）+「取消扫描」「取消并清空排队」按钮，
+  通过 SSE `scan_update` 与 1.5s 轮询同步；扫描结束后保留结果条可手动关闭。
+
 ## v1.1.5（2026-11-10）
 
 修复版本：ASR 运行方式切到「llama-swap 托管」时误报「llama 托管暂无已部署模型，请先下载并部署」。

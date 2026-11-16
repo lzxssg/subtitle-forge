@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from . import config, database as db
 from . import models_download
 from .queue_manager import smart_queue, enqueue_path
+from .scan_control import SCAN
 from .services import device_probe, metrics
 from .services.llm_client import get_client
 
@@ -112,9 +113,15 @@ async def startup():
             "('pending','polishing','extracting','transcribing','checking','translating','checking_translation','transcribed')"
         ).fetchall()
     phase_mode = db.get_setting("phase_mode", "pipeline") or "pipeline"
+    sync_mode = smart_queue.mode() == "sync"
     for r in rows:
-        if r["status"] != "pending":
-            if r["status"] == "transcribed":
+        st = r["status"]
+        # v1.1.11 sync：阶段中间态原样保留，交回批次闸门按阶段继续
+        if sync_mode and st in ("transcribed", "translated", "reviewed"):
+            smart_queue.submit(r["id"])
+            continue
+        if st != "pending":
+            if st == "transcribed":
                 # staged 翻译阶段任务：保留状态，等 checkpoint 统一启动翻译
                 if phase_mode != "staged":
                     smart_queue.submit(r["id"])
@@ -141,6 +148,14 @@ async def startup():
         logger.info("定时扫描已启用: 每 %d 分钟", interval)
     else:
         logger.info("当前模式 %s，不启动定时扫描", mode)
+
+    # v1.1.8：「已有字幕」统计兜底刷新（启动 30s 后，若统计缺失或超过 12h 未更新则后台重算）
+    try:
+        if _need_existing_refresh():
+            threading.Timer(30.0, lambda: threading.Thread(
+                target=_refresh_existing_stats, daemon=True).start()).start()
+    except Exception:
+        logger.warning("启动已有字幕统计刷新失败（忽略）", exc_info=True)
 
     # 资源采样线程
     ev = threading.Event()
@@ -336,9 +351,55 @@ async def api_status():
     }
 
 
+_existing_refresh_lock = threading.Lock()
+
+
+def _need_existing_refresh(max_age=12 * 3600):
+    try:
+        last = float(db.get_setting("scan_last_at") or 0)
+    except Exception:
+        last = 0.0
+    return (time.time() - last) > max_age
+
+
+def _refresh_existing_stats():
+    """v1.1.8：后台轻量重算「已有字幕」数（只做文件名匹配，不查库、不 ffprobe）。"""
+    if not _existing_refresh_lock.acquire(blocking=False):
+        return {"ok": False, "error": "统计任务正在运行"}
+    try:
+        from .watcher import count_existing_subtitles
+        if SCAN.running():
+            return {"ok": False, "error": "扫描进行中，稍后再试"}
+        t0 = time.time()
+        existing, videos = count_existing_subtitles()
+        db.set_setting("scan_existing_count", int(existing))
+        db.set_setting("scan_video_count", int(videos))
+        from .watcher import LAST_SCAN_SKIP
+        db.set_setting("scan_unsupported_count", int(LAST_SCAN_SKIP.get("unsupported") or 0))
+        db.set_setting("scan_last_at", time.time())
+        logger.info("已有字幕统计刷新完成：%s/%s 个视频已有字幕，用时 %.1fs",
+                    existing, videos, time.time() - t0)
+        return {"ok": True, "existing": int(existing), "videos": int(videos),
+                "elapsed": round(time.time() - t0, 1)}
+    except Exception as e:
+        logger.warning("已有字幕统计刷新失败: %s", e)
+        return {"ok": False, "error": str(e)}
+    finally:
+        _existing_refresh_lock.release()
+
+
 @app.get("/api/stats")
 async def api_stats():
     return db.task_stats()
+
+
+@app.post("/api/stats/existing/refresh")
+async def api_stats_existing_refresh():
+    """手动触发「已有字幕」统计重算（后台执行，可重复调用）。"""
+    if SCAN.running():
+        return {"ok": False, "error": "扫描进行中，稍后再试"}
+    threading.Thread(target=_refresh_existing_stats, daemon=True).start()
+    return {"ok": True, "started": True}
 
 
 @app.get("/api/dirs")
@@ -548,7 +609,8 @@ async def api_set_mode(body: ModeBody):
 
 class QueuePauseBody(BaseModel):
     paused: bool
-    force_unload: bool = False
+    # v1.1.7：恢复队列默认接入任务修复（卸载闲置模型、解死锁、重建线程、预热并续跑）
+    force_unload: bool = True
 
 
 @app.post("/api/queue/pause")
@@ -556,15 +618,17 @@ async def api_queue_pause(body: QueuePauseBody):
     """暂停/恢复任务队列。
 
     暂停：不再领取新任务，并把所有进行中的任务挂起（已完成的环节产物保留，恢复后续跑）。
-    恢复：所有暂停任务重新入队；force_unload=True 时同时执行任务修复
-          （强制卸载闲置 LLM 模型释放显存 → 解除批次死锁 → 重建工作线程 → 预热工作模型 → 立即续跑）。
+    恢复（v1.1.7 默认接入任务修复）：走一次 repair —— 强制卸载闲置 LLM 模型释放显存
+          → 强杀卡住的提取进程 → 解除批次死锁 → 中间态任务归位 → 重建工作线程
+          → 预热工作模型 → 立即续跑。传 force_unload=false 可退化为「仅放行」。
     """
     if body.paused:
         n = smart_queue.pause_all()
     else:
         n = smart_queue.resume_all(force_unload=body.force_unload)
     _broadcast("task_update", {"queue_paused": body.paused, "affected": n})
-    resp = {"ok": True, "paused": body.paused, "affected": n}
+    resp = {"ok": True, "paused": body.paused, "affected": n,
+            "repaired": bool(not body.paused and body.force_unload)}
     if not body.paused and body.force_unload:
         resp["repair"] = smart_queue.repair_state()
     return resp
@@ -607,19 +671,37 @@ async def api_queue_watchdog_tick():
 
 
 @app.post("/api/tasks/cancel-all")
-async def api_cancel_all():
-    """取消所有任务（清空排队 + 标记活动任务取消）。"""
+async def api_cancel_all(purge_scan: bool = True):
+    """取消所有任务（清空排队 + 标记活动任务取消）。
+
+    v1.1.6：默认先取消正在运行的扫描任务——否则扫描线程还会继续往队列塞新任务，
+    表现为「点了取消，任务又冒出来」。
+    """
+    scan_cancelled = SCAN.cancel() if purge_scan else 0
     n = smart_queue.cancel_all()
     _broadcast("task_update", {"bulk": "cancelled"})
-    return {"ok": True, "cancelled": n}
+    _broadcast("scan_update", SCAN.status())
+    return {"ok": True, "cancelled": n, "scan_cancelled": scan_cancelled}
 
 
 @app.post("/api/tasks/clear-all")
-async def api_clear_all():
-    """清空全部任务与字幕记录（不影响已生成字幕文件）。"""
+async def api_clear_all(purge_scan: bool = True):
+    """清空全部任务与字幕记录（不影响已生成字幕文件）。
+
+    v1.1.6：先中止扫描、再中断在跑任务，最后清记录。顺序很重要：
+    直接清记录时扫描仍在跑，会立刻重新入队，用户看到的就是「清空没用」。
+    """
+    scan_cancelled = 0
+    if purge_scan:
+        scan_cancelled = SCAN.cancel()
+        if scan_cancelled:
+            # 给扫描线程一点时间退出遍历，避免清完又被塞回来
+            await asyncio.sleep(0.6)
+    smart_queue.cancel_all()
     n = smart_queue.clear_all()
     _broadcast("task_update", {"bulk": "cleared"})
-    return {"ok": True, "deleted": n}
+    _broadcast("scan_update", SCAN.status())
+    return {"ok": True, "deleted": n, "scan_cancelled": scan_cancelled}
 
 
 _ASR_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/\-]{0,63}")
@@ -852,71 +934,212 @@ async def api_add_task(body: AddTaskBody):
     if p.is_dir():
         # 扫描目录下视频（可选递归）
         added = 0
+        skipped_duration = 0
+        stats = {}
         ext_set = {e.strip().lower() for e in str(db.get_setting("video_exts")).split(",") if e.strip()}
         files = p.rglob("*") if body.recursive else p.glob("*")
         for f in files:
             if f.is_file() and f.suffix.lower() in ext_set:
-                tid = enqueue_path(str(f), source="manual")
+                tid = enqueue_path(str(f), source="manual", stats=stats)
                 if tid:
                     added += 1
-        return {"ok": True, "added": added}
-    tid = enqueue_path(str(p), source="manual")
+        skipped_duration = int((stats or {}).get("skipped_duration") or 0)
+        return {"ok": True, "added": added, "skipped_duration": skipped_duration,
+                "limit_minutes": (stats or {}).get("limit_minutes")}
+    # v1.1.7：单文件入队前先判时长，命中上限直接说明原因，不再静默返回空 task_id
+    from .watcher import duration_exceeded, max_video_minutes
+    over, dur = duration_exceeded(str(p))
+    if over:
+        return {"ok": False,
+                "error": f"视频时长 {dur / 60:.0f} 分钟，超过上限 "
+                         f"{max_video_minutes()} 分钟（可在设置中调整「最长视频时长」）"}
+    tid = enqueue_path(str(p), source="manual", duration=dur)
     return {"ok": True, "task_id": tid}
+
+
+# ---------- 扫描任务（后台线程 + 可取消） ----------
+_scan_bcast_lock = threading.Lock()
+_scan_bcast_ts = {}
+
+
+def _scan_broadcast(job, min_interval: float = 0.8):
+    """进度广播节流：扫描按文件数回调很密，0.8s 内只推一次，避免刷爆 SSE。"""
+    now = time.time()
+    with _scan_bcast_lock:
+        if now - _scan_bcast_ts.get(job.id, 0) < min_interval:
+            return
+        _scan_bcast_ts[job.id] = now
+    _broadcast("scan_update", SCAN.status())
+
+
+def _launch_scan(job, runner):
+    """在后台线程执行扫描任务，结束后写入终态并广播给前端。
+
+    v1.1.8：扫描结束把「已有字幕」跳过数落盘，供首页「已有字幕」统计展示。
+    """
+    def _target():
+        try:
+            from .watcher import reset_scan_skip
+            reset_scan_skip()
+        except Exception:
+            pass
+        try:
+            runner(job)
+            SCAN.finish(job, "cancelled" if job.cancel_requested else "done")
+        except Exception as e:
+            logger.exception("扫描任务 %s(%s) 执行失败", job.label, job.id)
+            SCAN.finish(job, "failed", str(e))
+        finally:
+            try:
+                from .watcher import LAST_SCAN_SKIP
+                db.set_setting("scan_existing_count", int(LAST_SCAN_SKIP.get("existing") or 0))
+                db.set_setting("scan_unsupported_count", int(LAST_SCAN_SKIP.get("unsupported") or 0))
+                db.set_setting("scan_last_at", time.time())
+                logger.info("扫描跳过明细：已有字幕 %s / 超长 %s / 进行中 %s / 不支持格式 %s",
+                            LAST_SCAN_SKIP.get("existing"), LAST_SCAN_SKIP.get("duration"),
+                            LAST_SCAN_SKIP.get("active"), LAST_SCAN_SKIP.get("unsupported"))
+            except Exception:
+                logger.warning("写入扫描跳过统计失败（忽略）", exc_info=True)
+            _broadcast("scan_update", SCAN.status())
+
+    threading.Thread(target=_target, name=f"scan-{job.id}", daemon=True).start()
+    _broadcast("scan_update", SCAN.status())
 
 
 @app.post("/api/scan")
 async def api_scan():
+    """扫描全部监控目录（后台执行，可取消）。"""
     from .watcher import scan_dirs
-    added = await asyncio.to_thread(scan_dirs, True)
-    return {"ok": True, "added": added}
+    dirs = db.watch_dir_list()
+    if not dirs:
+        return {"ok": False, "error": "监控目录未配置"}
+    job = SCAN.start("scan_all", dirs)
+    if job is None:
+        return {"ok": False, "error": "已有扫描任务在运行，请先取消或等它跑完",
+                "running": SCAN.running()}
+
+    def _runner(j):
+        stats = {}
+        try:
+            from .watcher import max_video_minutes
+            j.limit_minutes = max_video_minutes()
+        except Exception:
+            pass
+
+        def _p(p, a, cur):
+            SCAN.progress(j, processed=p, enqueued=a, current=cur,
+                          skipped=stats.get("skipped_duration"))
+            _scan_broadcast(j)
+
+        added = scan_dirs(True, cancel_cb=lambda: j.cancel_requested,
+                          on_progress=_p, dirs=dirs, stats=stats)
+        j.enqueued = added
+        j.skipped = int(stats.get("skipped_duration") or 0)
+        j.processed = max(j.processed, 0)
+
+    _launch_scan(job, _runner)
+    return {"ok": True, "started": True, "job_id": job.id, "kind": job.kind,
+            "label": job.label, "dirs": job.dirs}
+
+
+def _run_multi_dir_scan(job, fn_name, label):
+    """多监控目录逐个扫描：单个目录被取消即整体停止。"""
+    from . import queue_manager
+    fn = getattr(queue_manager, fn_name)
+    for d in job.dirs:
+        if job.cancel_requested:
+            return
+        if not os.path.isdir(d):
+            continue
+        # 扫描期间被移除的监控目录直接跳过（对应「取消文件夹勾选」的预期）
+        try:
+            live = {x.strip().rstrip("/") for x in
+                    str(db.get_setting("watch_dirs")).split(",") if x.strip()}
+            if live and d.strip().rstrip("/") not in live:
+                logger.info("扫描跳过已移除的监控目录: %s", d)
+                continue
+        except Exception:
+            pass
+        base_p, base_e, base_s, base_t = (job.processed, job.enqueued,
+                                          job.skipped, job.total)
+
+        def _cb(processed, enqueued, current, _bp=base_p, _be=base_e,
+                _bs=base_s, _bt=base_t):
+            SCAN.progress(job, processed=_bp + (processed or 0),
+                          enqueued=_be + (enqueued or 0), current=str(current or ""))
+            _scan_broadcast(job)
+
+        e, s, t = fn(d, cancel_cb=lambda: job.cancel_requested, on_progress=_cb)
+        job.enqueued = base_e + e
+        job.skipped = base_s + s
+        job.total = base_t + t
+
+
+def _start_scan_job(kind, label, fn_name):
+    dirs = db.watch_dir_list()
+    if not dirs:
+        return {"ok": False, "error": "监控目录未配置"}
+    job = SCAN.start(kind, dirs)
+    if job is None:
+        return {"ok": False, "error": "已有扫描任务在运行，请先取消或等它跑完",
+                "running": SCAN.running()}
+    # v1.1.7：把本次生效的「最长视频时长」上限带到扫描状态里，前端可展示超长排除
+    try:
+        from .watcher import max_video_minutes
+        job.limit_minutes = max_video_minutes()
+    except Exception:
+        pass
+    _launch_scan(job, lambda j: _run_multi_dir_scan(j, fn_name, label))
+    return {"ok": True, "started": True, "job_id": job.id, "kind": job.kind,
+            "label": job.label, "dirs": job.dirs}
 
 
 @app.post("/api/polish/scan")
 async def api_polish_scan():
-    """一键扫描润色：扫描监控目录下所有中文字幕，批量入队润色（跳过已有 .zh.rs.srt）。"""
-    from .queue_manager import scan_polish_jobs
-    dirs = [d.strip() for d in db.get_setting("watch_dirs", "").split(",") if d.strip()]
-    if not dirs:
-        return {"ok": False, "error": "监控目录未配置"}
-    enqueued = skipped = total = 0
-    for d in dirs:
-        if not os.path.isdir(d):
-            continue
-        e, s, t = await asyncio.to_thread(scan_polish_jobs, d)
-        enqueued += e; skipped += s; total += t
-    return {"ok": True, "enqueued": enqueued, "skipped": skipped, "total": total}
+    """一键扫描润色（后台执行，可取消）：扫描监控目录下所有中文字幕，批量入队润色。"""
+    return _start_scan_job("polish", "一键润色", "scan_polish_jobs")
 
 
 @app.post("/api/scan/transcribe")
 async def api_scan_transcribe():
-    """一键扫描只转录：扫描监控目录，尚无转录字幕的视频批量入队（只转录不翻译）。"""
-    from .queue_manager import scan_transcribe_jobs
-    dirs = [d.strip() for d in db.get_setting("watch_dirs", "").split(",") if d.strip()]
-    if not dirs:
-        return {"ok": False, "error": "监控目录未配置"}
-    enqueued = skipped = total = 0
-    for d in dirs:
-        if not os.path.isdir(d):
-            continue
-        e, s, t = await asyncio.to_thread(scan_transcribe_jobs, d)
-        enqueued += e; skipped += s; total += t
-    return {"ok": True, "enqueued": enqueued, "skipped": skipped, "total": total}
+    """一键扫描只转录（后台执行，可取消）：尚无转录字幕的视频批量入队，只转录不翻译。"""
+    return _start_scan_job("transcribe", "一键转录", "scan_transcribe_jobs")
 
 
 @app.post("/api/scan/translate")
 async def api_scan_translate():
-    """一键扫描转录字幕只翻译：扫描监控目录，已有外文字幕（任意语言）的视频批量入队只翻译。"""
-    from .queue_manager import scan_translate_jobs
-    dirs = [d.strip() for d in db.get_setting("watch_dirs", "").split(",") if d.strip()]
-    if not dirs:
-        return {"ok": False, "error": "监控目录未配置"}
-    enqueued = skipped = total = 0
-    for d in dirs:
-        if not os.path.isdir(d):
-            continue
-        e, s, t = await asyncio.to_thread(scan_translate_jobs, d)
-        enqueued += e; skipped += s; total += t
-    return {"ok": True, "enqueued": enqueued, "skipped": skipped, "total": total}
+    """一键扫描转录字幕只翻译（后台执行，可取消）：已有外文字幕的视频批量入队只翻译。"""
+    return _start_scan_job("translate", "一键翻译", "scan_translate_jobs")
+
+
+class ScanCancelBody(BaseModel):
+    job_id: str = ""
+    purge: bool = False        # 同时清理本次扫描入队、尚未开始的任务
+    purge_all: bool = False    # 清理所有未开始的任务（不区分来源）
+    delete: bool = False       # 清理时直接删除记录（默认仅标记 cancelled）
+
+
+@app.get("/api/scan/status")
+async def api_scan_status():
+    """扫描任务状态：运行中的进度 + 最近一次结束结果。"""
+    return SCAN.status()
+
+
+@app.post("/api/scan/cancel")
+async def api_scan_cancel(body: ScanCancelBody = None):
+    """取消正在运行的扫描任务；可选连带清理扫描已入队但尚未开始的任务。"""
+    body = body or ScanCancelBody()
+    n = SCAN.cancel(body.job_id or None)
+    purged = 0
+    if body.purge or body.purge_all:
+        sources = None
+        if not body.purge_all:
+            sources = {"scan", "scan_transcribe", "scan_translate", "scan_polish"}
+        purged = smart_queue.clear_pending(sources=sources, delete=body.delete)
+    _broadcast("scan_update", SCAN.status())
+    _broadcast("task_update", {"bulk": "scan_cancelled"})
+    return {"ok": True, "cancelled": n, "purged": purged,
+            "running": SCAN.running()}
 
 
 @app.post("/api/tasks/{task_id}/pause")
@@ -924,8 +1147,9 @@ async def api_pause(task_id: int):
     t = db.get_task(task_id)
     if not t:
         return {"ok": False, "error": "任务不存在"}
-    if t["status"] not in ("pending", "transcribed"):
-        return {"ok": False, "error": f"状态 {t['status']} 不可暂停（仅排队中的任务可暂停）"}
+    if t["status"] not in ("pending", "transcribed", "translated", "reviewed"):
+        return {"ok": False, "error": f"状态 {t['status']} 不可暂停（仅排队中或待下一阶段的任务可暂停）"}
+    db.update_task_meta(task_id, paused_from=t["status"])
     db.update_task(task_id, status="paused", error="")
     _broadcast("task_update", {"id": task_id, "status": "paused", "progress": t["progress"]})
     return {"ok": True}
@@ -938,9 +1162,18 @@ async def api_resume(task_id: int):
         return {"ok": False, "error": "任务不存在"}
     if t["status"] != "paused":
         return {"ok": False, "error": f"状态 {t['status']} 不可恢复"}
-    db.update_task(task_id, status="pending", progress=t["progress"] or 0, error="")
+    # v1.1.11：恢复时回到暂停前的阶段状态（避免 sync 中间态任务被重置成 pending 重跑转录）
+    try:
+        meta = db.task_meta(task_id)
+    except Exception:
+        meta = {}
+    back = (meta.get("paused_from") or "pending")
+    if back not in ("pending", "transcribed", "translated", "reviewed"):
+        back = "pending"
+    db.update_task(task_id, status=back, progress=t["progress"] or 0, error="")
+    db.update_task_meta(task_id, paused_from="")
     smart_queue.submit(task_id)
-    _broadcast("task_update", {"id": task_id, "status": "pending", "progress": t["progress"]})
+    _broadcast("task_update", {"id": task_id, "status": back, "progress": t["progress"]})
     return {"ok": True}
 
 
@@ -1043,6 +1276,12 @@ async def api_set_config(body: ConfigBody):
                 v = max(1, min(100, int(float(v))))
             except (TypeError, ValueError):
                 v = 20
+        elif k == "max_video_minutes":
+            # v1.1.7：最长视频时长（分钟），0 = 不限制，上限 2880（48h）
+            try:
+                v = max(0, min(2880, int(float(v))))
+            except (TypeError, ValueError):
+                v = 240
         elif k == "enhanced_transcribe_enabled":
             v = str(v).strip().lower() in ("1", "true", "yes", "on")
         elif k == "enhanced_asr_model":

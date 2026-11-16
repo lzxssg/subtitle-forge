@@ -38,6 +38,9 @@ h2 { font-size: 14px; font-weight: 600; color: var(--muted); letter-spacing: .5p
 .stat .k { font-size: 12px; color: var(--muted); }
 .stat .v { font-size: 26px; font-weight: 700; margin-top: 4px; line-height: 1.1; }
 .stat .s { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.stat .hours { display: flex; gap: 1px; align-items: flex-end; height: 16px; margin-top: 6px; }
+.stat .hours i { flex: 1; display: block; background: var(--sc, var(--green)); opacity: .55; border-radius: 1px; min-height: 1px; }
+.stat .hours i:hover { opacity: 1; }
 
 /* ---------- 工作区卡片 ---------- */
 .section { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 20px; }
@@ -149,6 +152,19 @@ button.btn-func:disabled { opacity: .45; }
 .empty { color: var(--muted); text-align: center; padding: 34px; font-size: 13px; }
 .empty.small { padding: 18px; font-size: 12px; }
 .scan-banner { background: rgba(52,199,89,.10); border: 1px solid #34c75944; color: var(--green); border-radius: 8px; padding: 8px 12px; font-size: 13px; margin-bottom: 12px; }
+/* v1.1.6 扫描任务面板：进度 + 取消 */
+.scan-panel { display: none; flex-direction: column; gap: 6px; background: rgba(255,159,10,.08); border: 1px solid rgba(255,159,10,.38); border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; font-size: 13px; }
+.scan-panel.running { display: flex; }
+.scan-panel.done { background: rgba(52,199,89,.10); border-color: #34c75944; }
+.scan-panel.fail { background: rgba(240,82,77,.10); border-color: rgba(240,82,77,.45); }
+.scan-panel .scan-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.scan-panel .scan-title { font-weight: 600; }
+.scan-panel .scan-counts { color: var(--muted); font-size: 12px; }
+.scan-panel .scan-cur { color: var(--muted); font-size: 11px; word-break: break-all; max-height: 30px; overflow: hidden; }
+.scan-panel .scan-bar { height: 4px; background: rgba(255,255,255,.12); border-radius: 2px; overflow: hidden; display: none; }
+.scan-panel .scan-bar.on { display: block; }
+.scan-panel .scan-bar > i { display: block; height: 100%; width: 0; background: var(--accent, #4c8dff); transition: width .3s; }
+.scan-panel .spacer { flex: 1; }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: 0 0 auto; }
 .dot.active { background: #34c759; }
 .dot.pending { background: #e3a63b; }
@@ -252,7 +268,7 @@ button.small.active { background: var(--accent); color: #fff; }
     <div class="logo">🎬</div>
     <div>
       <h1>SubtitleForge 智能字幕工厂</h1>
-      <small id="app-ver">v1.1.5 · by:lzxssg</small>
+      <small id="app-ver">v1.1.4 · by:lzxssg</small>
     </div>
   </div>
   <div class="top-right">
@@ -266,12 +282,12 @@ button.small.active { background: var(--accent); color: #fff; }
   <!-- 统计面板 -->
   <h2>任务统计</h2>
   <div class="stats-grid" id="statsGrid">
-    <div class="stat" style="--sc:var(--accent)"><div class="k">累计生成</div><div class="v" id="stTotal">-</div><div class="s">全部任务数</div></div>
-    <div class="stat" style="--sc:var(--green)"><div class="k">今日生成</div><div class="v" id="stTodayDone">-</div><div class="s">今日完成</div></div>
+    <div class="stat" style="--sc:var(--accent)"><div class="k">累计生成</div><div class="v" id="stTotal">-</div><div class="s">不含已取消</div></div>
+    <div class="stat" style="--sc:var(--green)"><div class="k">今日生成</div><div class="v" id="stTodayDone">-</div><div class="s" id="stTodayHint">今日 00:00–24:00 完成</div><div class="hours" id="stTodayHours"></div></div>
     <div class="stat" style="--sc:var(--cyan)"><div class="k">已完成</div><div class="v" id="stDone">-</div><div class="s">生成成功</div></div>
-    <div class="stat" style="--sc:var(--yellow)"><div class="k">等待队列</div><div class="v" id="stWaiting">-</div><div class="s">排队中 / 进行中</div></div>
-    <div class="stat" style="--sc:var(--muted)"><div class="k">已有字幕</div><div class="v" id="stSkipped">-</div><div class="s">自动跳过</div></div>
-    <div class="stat" style="--sc:var(--red)"><div class="k">不支持</div><div class="v" id="stUnsupported">-</div><div class="s">格式不支持</div></div>
+    <div class="stat" style="--sc:var(--yellow)"><div class="k">等待队列</div><div class="v" id="stWaiting">-</div><div class="s">批内各阶段待跑</div></div>
+    <div class="stat" style="--sc:var(--muted);cursor:pointer" title="点击重新统计媒体库中已有字幕的视频数" onclick="refreshExistingStats(event)"><div class="k">已有字幕</div><div class="v" id="stSkipped">-</div><div class="s" id="stSkippedHint">扫描时自动跳过</div></div>
+    <div class="stat" style="--sc:var(--red)"><div class="k">不支持</div><div class="v" id="stUnsupported">-</div><div class="s">格式/编码不支持</div></div>
     <div class="stat" style="--sc:var(--red)"><div class="k">失败</div><div class="v" id="stFailed">-</div><div class="s">需要处理</div></div>
   </div>
 
@@ -299,6 +315,20 @@ button.small.active { background: var(--accent); color: #fff; }
       <button class="small" onclick="scanTranscribeNow()" title="扫描监控目录，尚无转录字幕的视频批量入队，只转录不翻译">一键转录</button>
       <button class="small" onclick="scanTranslateNow()" title="扫描监控目录，已有外文字幕的视频批量入队，只翻译不转录">一键翻译</button>
       <button class="small" onclick="scanPolishNow()" title="扫描媒体目录下所有中文字幕，批量润色为自然中文（已有 .zh.rs.srt 的自动跳过）">一键润色</button>
+    </div>
+    <!-- v1.1.6 扫描任务面板：显示进度并提供取消 -->
+    <div class="scan-panel" id="scanPanel">
+      <div class="scan-row">
+        <span class="dot pending" id="scanDot"></span>
+        <span class="scan-title" id="scanTitle">正在扫描</span>
+        <span class="scan-counts" id="scanCounts"></span>
+        <span class="spacer"></span>
+        <button class="small btn-func" id="scanCancelBtn" onclick="cancelScan(false)">取消扫描</button>
+        <button class="small btn-func" id="scanCancelAllBtn" onclick="cancelScan(true)" title="停止扫描，并把所有排队中尚未开始的任务标记为已取消">取消并清空排队</button>
+        <button class="small" id="scanHideBtn" style="display:none" onclick="hideScanPanel()">关闭</button>
+      </div>
+      <div class="scan-cur" id="scanCurrent"></div>
+      <div class="scan-bar" id="scanBar"><i id="scanBarFill"></i></div>
     </div>
     <div id="multiAddPanel" style="display:none;margin-bottom:10px;border:1px solid var(--border);border-radius:8px;padding:10px;background:var(--panel2)">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
@@ -416,7 +446,7 @@ button.small.active { background: var(--accent); color: #fff; }
 
     <!-- 翻译 API -->
     <div id="tab-llm" class="tab-panel">
-      <div class="form-row"><label>API 地址 (Base URL)</label><input type="text" id="cfg_llm_base_url" placeholder="https://api.deepseek.com/v1 或 http://127.0.0.1:11435/v1" onchange="refreshLlms('llm')"><div class="form-hint">支持任意 OpenAI 兼容接口：DeepSeek / Ollama / Sakura / 硅基流动 等</div></div>
+      <div class="form-row"><label>API 地址 (Base URL)</label><input type="text" id="cfg_llm_base_url" placeholder="https://api.deepseek.com/v1 或 http://127.0.0.1:11434/v1" onchange="refreshLlms('llm')"><div class="form-hint">支持任意 OpenAI 兼容接口：DeepSeek / Ollama / Sakura / 硅基流动 等</div></div>
       <div class="form-row"><label>API Key</label><input type="password" id="cfg_llm_api_key" placeholder="本地模型可留空"></div>
       <div class="form-row"><label>翻译模型</label><div style="flex:1;display:flex;flex-direction:column;gap:6px"><div style="display:flex;gap:6px"><select id="cfg_llm_model" style="flex:1" onchange="onModelSelectChange('cfg_llm_model')"></select><button type="button" class="mini-btn" onclick="refreshLlms('llm')">刷新</button><button type="button" class="mini-btn" onclick="testLlm('llm')">测试</button></div><input type="text" id="cfg_llm_model_custom" placeholder="手动填写模型名" style="display:none" onchange="onModelCustomInput('cfg_llm_model')"></div><div class="form-hint" id="llm_test_result">填写 API 地址后点「刷新」拉取可选模型；云端不支持拉取时可选「手动输入…」</div></div>
       <div class="form-row"><label>翻译温度</label><input type="number" id="cfg_llm_temperature" step="0.1" min="0" max="2"></div>
@@ -534,10 +564,11 @@ button.small.active { background: var(--accent); color: #fff; }
     <div id="tab-queue" class="tab-panel" style="display:none">
       <div class="form-row"><label>调度模式</label><select id="cfg_scheduler_mode">
         <option value="auto">智能自动（按显存判断单/多模型）</option>
-        <option value="staged">单模型 · 环节串行（省显存）</option>
-        <option value="pipeline">单模型 · 任务串行</option>
+        <option value="sync">单模型 · 批内阶段同步（整批转录→整批翻译→整批校对→整批润色）</option>
+        <option value="staged">单模型 · 两阶段（仅整批转录→整批翻译，之后逐条校对润色）</option>
+        <option value="pipeline">单模型 · 任务串行（单条跑完全流程）</option>
         <option value="parallel">多模型 · 环节并行（大显存）</option>
-      </select><div class="form-hint">auto：显存充足时多模型环节并行；显存不足自动退化为单模型环节串行（同一时刻只驻留一个大模型，避免爆显存）。</div></div>
+      </select><div class="form-hint">auto：显存充足时多模型环节并行；显存不足自动退化为<b>批内阶段同步</b>——一批 20 个任务一起转录、全部转录完再一起质检、再一起翻译、再一起校对、再一起润色，阶段之间严格互斥，同一时刻只驻留一个大模型。</div></div>
       <div class="form-row"><label>智能队列</label><select id="cfg_smart_queue"><option value="true">开启（去重+优先级+按GPU自动限流）</option><option value="false">关闭（仅按手动并发执行）</option></select><div class="form-hint">开启后：重复文件自动去重、字幕缺失优先、转录/翻译并发由系统按 GPU 型号与显存自动推荐（仍可在下方手动覆盖）。</div></div>
       <div class="form-row"><label>任务线程数</label><select id="cfg_task_workers"><option value="1">1（推荐，受显存约束）</option><option value="2">2</option><option value="3">3</option><option value="4">4</option><option value="6">6</option><option value="8">8</option></select><div class="form-hint">同时处理几个任务（受显存约束）。</div></div>
       <div class="form-row"><label>同批次任务数量上限</label><input type="number" id="cfg_batch_size" min="1" max="100" step="1" value="20" style="width:110px"><div class="form-hint">1-100，默认 20。不论一键扫描出多少任务，只有当前这一批全部跑完（含失败）才会放行下一批；流水线/并行/两阶段模式都受此限制。</div></div>
@@ -552,6 +583,7 @@ button.small.active { background: var(--accent); color: #fff; }
       <div class="form-row"><label>跳过已有字幕</label><select id="cfg_skip_existing_subtitle"><option value="true">是（已存在目标字幕则跳过）</option><option value="false">否</option></select></div>
       <div class="form-row"><label>字幕文件后缀</label><input type="text" id="cfg_subtitle_suffix" placeholder=".zh"></div>
       <div class="form-row"><label>视频扩展名</label><input type="text" id="cfg_video_exts" placeholder=".mp4,.mkv,.avi,.mov,.ts,.m2ts,.rmvb"></div>
+      <div class="form-row"><label>最长视频时长</label><input type="number" id="cfg_max_video_minutes" min="0" max="2880" step="10" style="width:110px"><div class="form-hint">分钟，默认 <b>240</b>（4 小时）。超过该时长的视频不进入任务队列（扫描 / 一键转录 / 一键翻译 / Webhook 入库 / 手动添加一律排除）。填 <b>0</b> 表示不限制，超长片也可入队。</div></div>
       <div class="form-row"><label>转录质检阈值</label><input type="number" id="cfg_transcript_quality_threshold" min="0" max="100"></div>
       <div class="form-row"><label>翻译校对阈值</label><input type="number" id="cfg_translation_quality_threshold" min="0" max="100"></div>
       <div class="form-row"><label>未通过校验字幕归档</label><select id="cfg_review_archive_enabled"><option value="true">开启（转移到「未通过校验字幕」目录）</option><option value="false">关闭（保留在视频原目录）</option></select><div class="form-hint">目标目录在「翻译/校对大模型」页设置；开启后未通过质检的字幕会被移出视频目录，不再进入下一环节。</div></div>
@@ -622,7 +654,7 @@ fetch('/api/version', {cache: 'no-store'}).then(r => r.json()).then(d => {
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmt = n => n == null ? '-' : (typeof n === 'number' ? (Math.round(n*10)/10) : n);
 const STAGE_NAMES = { pending:'排队中', paused:'已暂停', extracting:'提取音频', transcribing:'语音转录', checking:'转录质检', transcribed:'待翻译', translating:'AI 翻译', checking_translation:'翻译校对', polishing:'字幕润色', done:'完成', failed:'失败', cancelled:'已取消', skipped:'已跳过' };
-const STAGE_COLORS = { pending:'var(--accent)', paused:'var(--muted)', extracting:'var(--yellow)', transcribing:'var(--yellow)', checking:'var(--yellow)', transcribed:'var(--accent)', translating:'var(--yellow)', checking_translation:'var(--yellow)', polishing:'var(--purple)', done:'var(--green)', failed:'var(--red)', cancelled:'var(--muted)', skipped:'var(--muted)' };
+const STAGE_COLORS = { pending:'var(--accent)', paused:'var(--muted)', extracting:'var(--yellow)', transcribing:'var(--yellow)', checking:'var(--yellow)', transcribed:'var(--accent)', translating:'var(--yellow)', translated:'var(--accent)', checking_translation:'var(--yellow)', reviewed:'var(--purple)', polishing:'var(--purple)', done:'var(--green)', failed:'var(--red)', cancelled:'var(--muted)', skipped:'var(--muted)' };
 
 // ---------- 图表 ----------
 const charts = {};
@@ -676,6 +708,41 @@ async function loadStatus() {
     if (recP && $('polishWorkersHint')) $('polishWorkersHint').textContent = '当前智能推荐：' + recP.reason + '；需任务线程数 ≥ 并发数才生效。';
   } catch(e) { /* ignore */ }
 }
+function renderTodayHours(hourly) {
+  const box = $('stTodayHours');
+  if (!box) return;
+  const arr = Array.isArray(hourly) && hourly.length === 24 ? hourly : new Array(24).fill(0);
+  const max = Math.max(1, ...arr);
+  box.innerHTML = arr.map((n, h) => {
+    const hh = String(h).padStart(2, '0');
+    const pct = Math.max(6, Math.round(n / max * 100));
+    return `<i style="height:${pct}%" title="${hh}:00–${hh}:59 完成 ${n} 个"></i>`;
+  }).join('');
+  const total = arr.reduce((a, b) => a + b, 0);
+  const hEl = $('stTodayHint');
+  if (hEl) hEl.textContent = `00:00–24:00 完成 ${total} 个`;
+}
+
+async function refreshExistingStats(e) {
+  if (e) e.stopPropagation();
+  const v = $('stSkipped');
+  if (v) v.textContent = '…';
+  try {
+    const r = await fetch('/api/stats/existing/refresh', {method: 'POST'});
+    const d = await r.json();
+    if (!d.ok) { alert(d.error || '统计失败'); loadStats(); return; }
+    // 后台统计需要遍历媒体库，轮询刷新直到 scan_last_at 变化
+    const before = (statsData && statsData.scan_last_at) || 0;
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries += 1;
+      await loadStats();
+      const now = (statsData && statsData.scan_last_at) || 0;
+      if (now > before || tries > 120) clearInterval(timer);
+    }, 3000);
+  } catch (err) { loadStats(); }
+}
+
 async function loadStats() {
   try {
     const r = await fetch('/api/stats'); const d = await r.json();
@@ -684,8 +751,14 @@ async function loadStats() {
     $('stTotal').textContent = d.total ?? '-';
     $('stTodayDone').textContent = d.today_done ?? '-';
     $('stDone').textContent = d.done ?? '-';
-    $('stWaiting').textContent = (d.waiting ?? 0) + (d.active ?? 0);
-    $('stSkipped').textContent = d.skipped ?? '-';
+    $('stWaiting').textContent = d.waiting ?? 0;
+    $('stSkipped').textContent = d.scan_existing ?? d.skipped ?? '-';
+    const hint = $('stSkippedHint');
+    if (hint) {
+      const ts = d.scan_last_at ? new Date(d.scan_last_at * 1000) : null;
+      hint.textContent = ts ? ('统计于 ' + (ts.getMonth()+1) + '-' + ts.getDate() + ' ' + String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0')) : '点击重新统计';
+    }
+    renderTodayHours(d.today_hourly || []);
     $('stUnsupported').textContent = d.unsupported ?? '-';
     $('stFailed').textContent = d.failed ?? '-';
   } catch(e) {}
@@ -1071,7 +1144,8 @@ async function toggleQueuePause() {
     const rp = d.repair || {};
     const un = (rp.unloaded && rp.unloaded.length) ? `，已卸载 ${rp.unloaded.join('/')}` : '';
     const kd = rp.killed_extract ? `，终止 ${rp.killed_extract} 个卡住提取` : '';
-    toast(`队列已恢复，${d.affected ?? 0} 个任务重新入队${un}${kd}`);
+    const fx = rp.fixed_tasks ? `，归位 ${rp.fixed_tasks} 个中间态任务` : '';
+    toast(`队列已恢复（已执行任务修复），${d.affected ?? 0} 个任务重新入队${un}${kd}${fx}`);
   } else {
     toast(`队列已暂停，${d.affected ?? 0} 个任务挂起`);
   }
@@ -1121,66 +1195,148 @@ async function pauseQueue() {
   else toast('操作失败');
 }
 async function resumeQueue() {
-  const r = await fetch('/api/queue/pause', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ paused: false }) });
+  // v1.1.7：恢复队列接入任务修复（卸载闲置模型、解死锁、重建工作线程、预热并续跑）
+  const r = await fetch('/api/queue/pause', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ paused: false, force_unload: true }) });
   const d = await r.json();
-  if (d.ok) { toast('队列已恢复'); loadStatus(); }
+  if (d.ok) {
+    const rp = d.repair || {};
+    const un = (rp.unloaded && rp.unloaded.length) ? `，已卸载 ${rp.unloaded.join('/')}` : '';
+    const kd = rp.killed_extract ? `，终止 ${rp.killed_extract} 个卡住提取` : '';
+    toast(`队列已恢复（含任务修复），${d.affected ?? 0} 个任务重新入队${un}${kd}`);
+    loadStatus();
+  }
   else toast('操作失败');
 }
 async function cancelAllTasks() {
-  if (!confirm('确定取消所有任务？排队任务将清空，进行中任务将被取消（不影响已生成字幕）。')) return;
+  if (!confirm('确定取消所有任务？正在运行的扫描会一并停止，排队任务将清空，进行中任务将被取消（不影响已生成字幕）。')) return;
+  toast('正在取消…');
   const r = await fetch('/api/tasks/cancel-all', { method:'POST' }); const d = await r.json();
-  toast(d.ok ? `已取消 ${d.cancelled ?? 0} 个任务` : '操作失败'); loadTasks(); loadStats();
+  toast(d.ok ? `已取消 ${d.cancelled ?? 0} 个任务${d.scan_cancelled ? '，并停止扫描' : ''}` : '操作失败');
+  loadTasks(); loadStats(); pollScanStatus();
 }
 async function clearAllTasks() {
-  if (!confirm('确定清空全部任务记录与字幕记录？此操作不可恢复（不影响已生成的字幕文件）。')) return;
+  if (!confirm('确定清空全部任务记录与字幕记录？正在运行的扫描会先被停止，此操作不可恢复（不影响已生成的字幕文件）。')) return;
+  toast('正在清空…');
   const r = await fetch('/api/tasks/clear-all', { method:'POST' }); const d = await r.json();
-  toast(d.ok ? `已清空 ${d.deleted ?? 0} 条记录` : '操作失败'); loadTasks(); loadStats();
+  toast(d.ok ? `已清空 ${d.deleted ?? 0} 条记录${d.scan_cancelled ? '，并停止扫描' : ''}` : '操作失败');
+  loadTasks(); loadStats(); pollScanStatus();
 }
 async function clearFailedTasks() {
   if (!confirm('确定删除所有失败/已取消的任务记录？成功记录将保留，此操作不可恢复。')) return;
   const r = await fetch('/api/tasks/clear-failed', { method:'DELETE' }); const d = await r.json();
   toast(d.ok ? `已删除 ${d.deleted ?? 0} 条失败/取消记录` : '操作失败'); loadTasks(); loadStats();
 }
-async function scanNow() {
-  toast('正在扫描监控目录…');
-  try {
-    const r = await fetch('/api/scan', { method:'POST' }); const d = await r.json();
-    const n = d.added ?? 0;
-    const b = $('scanBanner');
-    if (b) { b.style.display = n ? '' : 'none'; b.textContent = n ? `✅ 本次扫描发现 ${n} 部新电影，已加入队列` : '✅ 扫描完成，未发现新电影'; setTimeout(() => { if (b) b.style.display = 'none'; }, 8000); }
-    toast(n ? `扫描完成，发现 ${n} 部新电影已入队` : '扫描完成，没有发现新电影');
-    loadTasks(); loadStats();
-  } catch(e) { toast('扫描失败'); }
+// ---------- 扫描任务（后台执行 + 可取消） ----------
+let _scanTimer = null;
+let _scanRunning = false;
+let _scanPanelClosed = false;
+
+function fmtCount(n) { return Number(n || 0).toLocaleString('zh-CN'); }
+
+function hideScanPanel() {
+  const p = $('scanPanel'); if (!p) return;
+  p.classList.remove('running', 'done', 'fail');
+  _scanPanelClosed = true;
 }
-async function scanPolishNow() {
-  toast('正在扫描中文字幕…');
-  try {
-    const r = await fetch('/api/polish/scan', { method:'POST' }); const d = await r.json();
-    if (d.ok === false) { toast(d.error || '扫描失败'); return; }
-    if (!d.total) { toast('未找到待润色的中文字幕'); return; }
-    toast(`润色扫描完成：新入队 ${d.enqueued} 个，已有润色跳过 ${d.skipped} 个（共 ${d.total} 个中文字幕）`);
-    loadTasks(); loadStats();
-  } catch(e) { toast('扫描失败'); }
+
+function renderScanStatus(d) {
+  const p = $('scanPanel'); if (!p) return;
+  const running = (d && d.running) || [];
+  if (running.length) {
+    const j = running[0];
+    _scanPanelClosed = false;
+    p.classList.add('running'); p.classList.remove('done', 'fail');
+    $('scanTitle').textContent = (j.cancelling ? '正在取消 ' : '正在执行 ') + (j.label || '扫描') + (running.length > 1 ? `（另有 ${running.length - 1} 个排队）` : '');
+    $('scanCounts').textContent = `已检查 ${fmtCount(j.processed)} 项 · 入队 ${fmtCount(j.enqueued)} 个` + (j.skipped ? ` · 跳过 ${fmtCount(j.skipped)}` : '') + (j.limit_minutes ? ` · 超长排除 ≤${j.limit_minutes} 分钟` : '') + (j.elapsed ? ` · ${j.elapsed}s` : '');
+    $('scanCurrent').textContent = j.current ? ('当前：' + j.current) : '';
+    const bar = $('scanBar');
+    if (j.total > 0) {
+      bar.classList.add('on');
+      $('scanBarFill').style.width = Math.min(100, Math.round(j.processed / j.total * 100)) + '%';
+    } else {
+      bar.classList.remove('on');
+    }
+    $('scanCancelBtn').style.display = '';
+    $('scanCancelAllBtn').style.display = '';
+    $('scanHideBtn').style.display = 'none';
+    $('scanCancelBtn').disabled = !!j.cancelling;
+    $('scanCancelBtn').textContent = j.cancelling ? '正在取消…' : '取消扫描';
+    $('scanCancelAllBtn').disabled = !!j.cancelling;
+  } else {
+    const j = (d && d.last) || null;
+    if (!j || _scanPanelClosed) { p.classList.remove('running'); return; }
+    const bad = j.status === 'failed';
+    p.classList.add(bad ? 'fail' : 'done'); p.classList.remove('running');
+    $('scanTitle').textContent = bad ? '扫描失败：' + (j.label || '')
+      : (j.status === 'cancelled' ? '已取消：' + (j.label || '扫描') : '已完成：' + (j.label || '扫描'));
+    $('scanCounts').textContent = `检查 ${fmtCount(j.processed)} 项 · 入队 ${fmtCount(j.enqueued)} 个` + (j.skipped ? ` · 跳过 ${fmtCount(j.skipped)}` : '') + (j.limit_minutes ? ` · 超长排除 >${j.limit_minutes} 分钟` : '') + (j.error ? ` · ${j.error}` : '');
+    $('scanCurrent').textContent = '';
+    $('scanBar').classList.remove('on');
+    $('scanCancelBtn').style.display = 'none';
+    $('scanCancelAllBtn').style.display = 'none';
+    $('scanHideBtn').style.display = '';
+  }
 }
-async function scanTranscribeNow() {
-  toast('正在扫描待转录视频…');
+
+async function pollScanStatus() {
   try {
-    const r = await fetch('/api/scan/transcribe', { method:'POST' }); const d = await r.json();
-    if (d.ok === false) { toast(d.error || '扫描失败'); return; }
-    if (!d.total) { toast('未找到待转录的视频'); return; }
-    toast(`转录扫描完成：新入队 ${d.enqueued} 个，已有转录跳过 ${d.skipped} 个（共 ${d.total} 个视频）`);
-    loadTasks(); loadStats();
-  } catch(e) { toast('扫描失败'); }
+    const r = await fetch('/api/scan/status', { cache:'no-store' });
+    const d = await r.json();
+    const running = (d.running || []).length > 0;
+    renderScanStatus(d);
+    if (running) {
+      if (!_scanRunning) { _scanRunning = true; loadTasks(); }
+      if (!_scanTimer) _scanTimer = setInterval(pollScanStatus, 1500);
+    } else {
+      if (_scanRunning) {
+        _scanRunning = false;
+        const j = d.last || {};
+        const msg = j.status === 'failed' ? `扫描失败：${j.error || '未知错误'}`
+          : j.status === 'cancelled' ? `已取消扫描（已检查 ${fmtCount(j.processed)} 项，入队 ${fmtCount(j.enqueued)} 个）`
+          : `扫描结束：检查 ${fmtCount(j.processed)} 项，入队 ${fmtCount(j.enqueued)} 个`;
+        toast(msg);
+        loadTasks(); loadStats();
+      }
+      if (_scanTimer) { clearInterval(_scanTimer); _scanTimer = null; }
+    }
+  } catch (e) {
+    if (_scanTimer) { clearInterval(_scanTimer); _scanTimer = null; }
+  }
 }
-async function scanTranslateNow() {
-  toast('正在扫描待翻译字幕…');
+
+async function _startScan(url, okTip) {
   try {
-    const r = await fetch('/api/scan/translate', { method:'POST' }); const d = await r.json();
-    if (d.ok === false) { toast(d.error || '扫描失败'); return; }
-    if (!d.total) { toast('未找到待翻译的外文字幕'); return; }
-    toast(`翻译扫描完成：新入队 ${d.enqueued} 个，已有翻译跳过 ${d.skipped} 个（共 ${d.total} 个字幕）`);
-    loadTasks(); loadStats();
-  } catch(e) { toast('扫描失败'); }
+    const r = await fetch(url, { method:'POST' });
+    const d = await r.json();
+    if (!d.ok) { toast(d.error || (d.running ? '已有扫描任务在运行，请先取消' : '扫描启动失败')); return; }
+    hideScanPanel(); _scanPanelClosed = false;
+    toast(okTip || `已开始${d.label || '扫描'}，可在上方取消`);
+    pollScanStatus();
+  } catch (e) { toast('扫描启动失败'); }
+}
+
+async function scanNow() { await _startScan('/api/scan', '已开始扫描，进度显示在监控目录下方，可随时取消'); }
+async function scanPolishNow() { await _startScan('/api/polish/scan', '已开始一键润色扫描，可随时取消'); }
+async function scanTranscribeNow() { await _startScan('/api/scan/transcribe', '已开始一键转录扫描，可随时取消'); }
+async function scanTranslateNow() { await _startScan('/api/scan/translate', '已开始一键翻译扫描，可随时取消'); }
+
+async function cancelScan(purgeAll) {
+  const tip = purgeAll
+    ? '停止扫描，并把所有「排队中尚未开始」的任务标记为已取消（保留记录，可再手动清理）？'
+    : '停止扫描，并把本次扫描已入队、尚未开始的任务标记为已取消？';
+  if (!confirm(tip)) return;
+  const btn = purgeAll ? $('scanCancelAllBtn') : $('scanCancelBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch('/api/scan/cancel', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ purge: true, purge_all: !!purgeAll })
+    });
+    const d = await r.json();
+    if (!d.ok) { toast('取消失败'); return; }
+    toast(d.purged ? `已取消扫描，并清理 ${d.purged} 个排队任务` : '已取消扫描');
+    pollScanStatus(); loadTasks(); loadStats();
+  } catch (e) { toast('取消失败'); }
 }
 
 // ---------- 任务 ----------
@@ -1369,7 +1525,20 @@ function renderTaskStats() {
   const s = statsData || {};
   $('statTotal').textContent = (s.total != null) ? s.total : totalCount;
   $('statActive').textContent = (s.running != null) ? s.running : (s.active || 0);
-  $('statWaiting').textContent = (batchState && typeof batchState.waiting === 'number') ? batchState.waiting : (s.waiting || 0);
+  $('statWaiting').textContent = (s.waiting != null) ? s.waiting : ((batchState && batchState.waiting) || 0);
+  {
+    // v1.1.10：等候口径统一为库内状态（pending 排队 + transcribed 待翻译），
+    // 调度队列数仅作为补充提示，避免与「总任务数」等库内计数对不上。
+    const el = $('statWaiting');
+    if (el) {
+      const q = (batchState && typeof batchState.waiting === 'number') ? batchState.waiting : null;
+      el.title = '排队中 ' + (s.waiting_pending || 0) + ' + 待翻译 ' + (s.waiting_transcribed || 0)
+        + (q != null ? '（调度队列 ' + q + '）' : '');
+    }
+    const tt = $('statTotal');
+    if (tt) tt.title = '不含已取消；等候 ' + (s.waiting || 0) + ' + 进行中 ' + (s.running || 0)
+      + ' + 已完成 ' + (s.done || 0) + ' + 失败 ' + (s.failed || 0) + ' = ' + s.total;
+  }
   $('statDone').textContent = s.done || 0;
   $('statFailed').textContent = s.failed || 0;
   const bEl = $('statBatch');
@@ -1703,6 +1872,7 @@ async function loadConfigForm() {
   $('cfg_skip_existing_subtitle').value = c.skip_existing_subtitle === false || c.skip_existing_subtitle === 'false' ? 'false' : 'true';
   $('cfg_subtitle_suffix').value = c.subtitle_suffix || '.zh';
   $('cfg_video_exts').value = c.video_exts || '.mp4,.mkv,.avi,.mov,.ts,.m2ts,.rmvb';
+  $('cfg_max_video_minutes').value = (c.max_video_minutes ?? 240);
   $('cfg_transcript_quality_threshold').value = c.transcript_quality_threshold ?? 60;
   $('cfg_translation_quality_threshold').value = c.translation_quality_threshold ?? 70;
   $('cfg_review_sample_count').value = c.review_sample_count ?? 12;
@@ -1767,6 +1937,7 @@ async function saveSettings() {
     skip_existing_subtitle: v('cfg_skip_existing_subtitle') === 'true',
     subtitle_suffix: v('cfg_subtitle_suffix').trim() || '.zh',
     video_exts: v('cfg_video_exts').trim() || '.mp4,.mkv,.avi,.mov,.ts,.m2ts,.rmvb',
+    max_video_minutes: (() => { const raw = (v('cfg_max_video_minutes') || '').trim(); if (!raw) return 240; return Math.max(0, Math.min(2880, Math.round(Number(raw) || 0))); })(),
     transcript_quality_threshold: Number(v('cfg_transcript_quality_threshold')) || 60,
     translation_quality_threshold: Number(v('cfg_translation_quality_threshold')) || 70,
     translate_only: v('cfg_translate_only') === 'true',
@@ -1839,6 +2010,10 @@ function connectSSE() {
     } catch(err) {}
     loadTasks();
   });
+  es.addEventListener('scan_update', e => {
+    try { renderScanStatus(JSON.parse(e.data || '{}')); } catch(err) {}
+    pollScanStatus();
+  });
   es.addEventListener('task_done', () => { loadTasks(); loadStats(); });
   es.addEventListener('task_failed', () => { loadTasks(); loadStats(); });
   es.addEventListener('tasks_retried', () => loadTasks());
@@ -1881,7 +2056,7 @@ initChart('cCpu', '#4d9fff', 100);
 initChart('cMem', '#3fb950', 100);
 initChart('cGpu', '#a78bfa', 100);
 initChart('cTok', '#e3a63b', 50);
-loadStatus(); loadStats(); loadDirs(); loadTasks(); connectSSE();
+loadStatus(); loadStats(); loadDirs(); loadTasks(); connectSSE(); pollScanStatus();
 setInterval(loadStatus, 15000);
 setInterval(loadStats, 10000);
 </script>

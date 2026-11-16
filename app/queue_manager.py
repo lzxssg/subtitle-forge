@@ -9,6 +9,8 @@ v2.1.0 调度模式（scheduler_mode）:
   staged   单模型·环节串行：全部任务转录完再集体翻译，同一时刻只驻留一个大模型
   pipeline 单模型·任务串行：一个任务走完全流程再进下一个
   parallel 多模型·环节并行：转录/翻译/润色各自独立并发，多模型同时驻留（大显存）
+  sync     批内阶段同步（v1.1.11）：整批先全部转录完 → 再全部翻译 → 再全部校对 →
+           再全部润色，阶段之间设闸门，不会出现「某任务一路跑完才轮到下一个」
   质检未通过的字幕按设置转移到「质检未通过字幕目录」，任务标记失败、不再进入下一环节
 """
 import json
@@ -29,6 +31,8 @@ logger = logging.getLogger("subtitle-forge.queue")
 # 转录相关状态（staged 模式下 Sakura 需要让出显存）
 TRANSCRIBE_STATUSES = ("pending", "extracting", "transcribing", "checking")
 TRANSCRIBED = "transcribed"
+TRANSLATED = "translated"      # v1.1.11 sync：已翻译、待校对
+REVIEWED = "reviewed"          # v1.1.11 sync：已校对、待润色
 TRANSLATING = "translating"
 
 STAGE_WEIGHTS = {
@@ -98,6 +102,7 @@ class SmartQueue:
         self._sakura_stopped = False      # 转录阶段已停 Sakura
         self._translation_started = False  # 翻译阶段已启动 Sakura 并提交 transcribed
         self._translate_submitted = set()  # 已提交翻译的任务 id，防重复入队
+        self._sync_stage = None            # v1.1.11 sync 批内阶段闸门：当前阶段
         self._event_hooks = []  # (event_type, payload) 回调
         # 阶段并发门：转录 / 翻译 各自限流（auto=按 GPU 画像智能推荐，可在 Web 界面调整）
         # 注：初始化为 1，真实值在 start()→apply_limits()（数据库初始化后）解析
@@ -191,18 +196,22 @@ class SmartQueue:
 
     # ---------- v2.1.0 调度模式 ----------
     def mode(self) -> str:
-        """当前调度模式：staged / pipeline / parallel。
+        """当前调度模式：staged / pipeline / parallel / sync。
 
+        - sync（v1.1.11 默认）：批内阶段同步，整批 20 个一起转录 → 一起翻译 →
+          一起校对 → 一起润色，阶段之间严格互斥，不会单个任务跑完全流程才排下一个。
+        - staged：只做「先整批转录、再整批翻译」两阶段，翻译后校对/润色随单任务流转。
+        - pipeline / parallel：单任务串行 / 多模型并发。
         配置为 auto 或空时按显卡显存自动判断：
-        显存总量 >= multi_model_vram_mb → parallel（多模型共存），否则 staged（单模型环节串行）。
+        显存总量 >= multi_model_vram_mb → parallel（多模型共存），否则 sync（单模型阶段同步）。
         """
         m = str(db.get_setting("scheduler_mode") or "auto").strip().lower()
-        if m in ("staged", "pipeline", "parallel"):
+        if m in ("staged", "pipeline", "parallel", "sync"):
             return m
         try:
-            return "parallel" if llm_manager.scheduler_mode() == "multi" else "staged"
+            return "parallel" if llm_manager.scheduler_mode() == "multi" else "sync"
         except Exception:
-            return "staged"
+            return "sync"
 
     def is_parallel(self) -> bool:
         return self.mode() == "parallel"
@@ -223,7 +232,15 @@ class SmartQueue:
             return 1
 
     def worker_count(self) -> int:
-        """工作线程数：单模型恒为 1（严格串行），多模型按各环节并发取最大值。"""
+        """工作线程数：单模型恒为 1（严格串行），多模型按各环节并发取最大值。
+
+        sync（批内阶段同步）按阶段并发上限取最大值：显存够时同阶段可并行，
+        阶段之间仍由 sync 闸门锁死，不会出现跨阶段混跑。
+        """
+        if self.mode() == "sync":
+            base = max(1, self._resolve_parallel("transcribe"),
+                       self._resolve_parallel("translate"), self._resolve_parallel("polish"))
+            return min(8, base)
         if not self.is_parallel():
             return 1
         base = max(2, self._resolve_parallel("transcribe"),
@@ -283,7 +300,9 @@ class SmartQueue:
         self._stop = False
         if worker_count is None:
             worker_count = int(db.get_setting("task_workers") or db.get_setting("max_workers") or 1)
-        if not self.is_parallel():
+        if self.mode() == "sync":
+            worker_count = self.worker_count()   # v1.1.11: 同阶段并发，阶段之间由 sync 闸门隔离
+        elif not self.is_parallel():
             worker_count = 1  # 单模型模式：严格串行，避免多任务抢占同一张显卡
         for i in range(max(1, worker_count)):
             t = threading.Thread(target=self._run_loop, daemon=True, name=f"worker-{i}")
@@ -449,9 +468,11 @@ class SmartQueue:
                 return default
         auto = str(db.get_setting("watchdog_auto_heal", "true")).strip().lower()
         auto = auto not in ("0", "false", "off", "no", "disable", "disabled")
+        # v1.1.12：翻译/校对/润色是「整批提交、整批等待」，单批 200 条最长可能跑到 1~2 分钟，
+        # 原 60s 阈值会把正常长批次误判为卡死并触发 repair，导致批次被切碎成 1~2 个。
         return (auto,
-                _int("watchdog_stuck_seconds", 60, 15),
-                _int("watchdog_idle_seconds", 180, 60))
+                _int("watchdog_stuck_seconds", 300, 120),
+                _int("watchdog_idle_seconds", 300, 120))
 
     def _watchdog_tick(self) -> dict:
         """单次巡检。返回 {stuck, idle_ticks, healed, report?}。"""
@@ -479,7 +500,12 @@ class SmartQueue:
                 t = db.get_task(tid)
             except Exception:
                 t = None
-            status = (t or {}).get("status")
+            status = None
+            if t is not None:
+                try:
+                    status = t["status"]
+                except Exception:
+                    status = None
             if status in ("cancelled", "paused", "failed", "done"):
                 # 任务已被取消/暂停但进程仍卡着：强杀，让 worker 线程自行返回
                 if extract_audio.kill_task(tid):
@@ -644,7 +670,17 @@ class SmartQueue:
         with self._batch_lock:
             self._waiting.clear()
             self._waiting_set.clear()
-            self._batch_members = [t for t in running]
+            # v1.1.12：保留本批所有仍处活动状态的成员（含阶段中间态），
+            # 只把已终态/已删除的清出去；否则 repair 后批次会缩成「正在跑的 1~2 个」。
+            keep_members = []
+            for tid in list(getattr(self, "_batch_members", None) or []):
+                t = db.get_task(tid)
+                if t and t["status"] in self.BATCH_ACTIVE_STATUSES:
+                    keep_members.append(tid)
+            for tid in running:
+                if tid not in keep_members:
+                    keep_members.append(tid)
+            self._batch_members = keep_members
             self._in_flight = set(running)
             self._requeue.clear()
             self._translate_submitted.clear()
@@ -776,7 +812,8 @@ class SmartQueue:
 
     # ---------- v2.3.0 同批次任务数量限制（批次闸门） ----------
     BATCH_ACTIVE_STATUSES = ("pending", "extracting", "transcribing", "checking",
-                             "transcribed", "translating", "checking_translation", "polishing")
+                             "transcribed", "translating", "checking_translation", "polishing",
+                             "translated", "reviewed")
     BATCH_END_STATUSES = ("done", "failed", "cancelled", "skipped", "paused")
 
     def batch_size(self) -> int:
@@ -815,9 +852,31 @@ class SmartQueue:
         上一批没跑完（含失败任务）绝不会提前进入下一批。
         """
         with self._batch_lock:
-            if self._batch_members:
-                return
             size = self.batch_size()
+            topping_up = False
+            if self._batch_members:
+                # v1.1.12：本批仍在转录阶段（成员全是待转录/转录中）时补满批次名额，
+                # 避免看门狗 repair 或去抖放行后批次只剩 1~2 个成员；
+                # 一旦有成员进入阶段中间态（transcribed/translated/reviewed 或翻译/校对/润色中），
+                # 批次立即锁死不再补人，保证整批阶段同步、杜绝跨阶段混跑。
+                if self.mode() != "sync":
+                    return
+                counts = self._batch_status_counts()
+                if any(counts.get(x) for x in (TRANSCRIBED, TRANSLATED, REVIEWED,
+                                               TRANSLATING, "checking_translation",
+                                               "polishing")):
+                    return
+                topping_up = True
+            # v1.1.11：sync 模式下把「已投入算力的阶段中间态」提到等候队列最前面，
+            # 否则已转录完的任务会排在几百个待转录任务之后干等（算力白耗）。
+            if self.mode() == "sync" and self._waiting:
+                mid = (TRANSCRIBED, TRANSLATED, REVIEWED)
+                head, tail = [], []
+                for tid in self._waiting:
+                    t = db.get_task(tid)
+                    (head if (t and t["status"] in mid) else tail).append(tid)
+                if head:
+                    self._waiting = head + tail
             admitted = []
             while self._waiting and len(admitted) < size:
                 tid = self._waiting.pop(0)
@@ -826,22 +885,40 @@ class SmartQueue:
                 if not t or t["status"] not in self.BATCH_ACTIVE_STATUSES:
                     continue  # 已结束/已删除/已暂停的任务直接跳过，不占批次名额
                 admitted.append(tid)
-            # 等候队列为空但仍有「已转录待翻译」的历史任务（如两阶段模式残留）时，
-            # 一并纳入本批，避免它们永远排不进批次
-            if not self._waiting and len(admitted) < size and self._phase_mode() == "staged":
-                for r in db.list_tasks_by_status([TRANSCRIBED]):
+            # 等候队列为空但仍有中间态历史任务（如两阶段残留 transcribed、
+            # sync 阶段同步残留 translated/reviewed）时，一并纳入本批，避免永远排不进批次
+            if not self._waiting and len(admitted) < size:
+                want = []
+                if self.mode() == "sync":
+                    want = [TRANSCRIBED, TRANSLATED, REVIEWED]
+                elif self._phase_mode() == "staged":
+                    want = [TRANSCRIBED]
+                for st in want:
                     if len(admitted) >= size:
                         break
-                    tid = r["id"]
-                    if tid in self._batch_members or tid in self._waiting_set or tid in admitted:
-                        continue
-                    admitted.append(tid)
+                    for r in db.list_tasks_by_status([st]):
+                        if len(admitted) >= size:
+                            break
+                        tid = r["id"]
+                        if tid in self._batch_members or tid in self._waiting_set or tid in admitted:
+                            continue
+                        admitted.append(tid)
             if not admitted:
                 return
-            self._batch_no += 1
-            self._batch_members = admitted
-            logger.info("第 %d 批放行 %d 个任务（批次上限 %d），等候队列剩余 %d",
-                        self._batch_no, len(admitted), size, len(self._waiting))
+            if topping_up:
+                room = max(0, size - len(self._batch_members))
+                admitted = admitted[:room]
+                if not admitted:
+                    return
+                self._batch_members.extend(admitted)
+                logger.info("第 %d 批补位 %d 个任务（批次 %d/%d），等候队列剩余 %d",
+                            self._batch_no, len(admitted), len(self._batch_members), size,
+                            len(self._waiting))
+            else:
+                self._batch_no += 1
+                self._batch_members = admitted
+                logger.info("第 %d 批放行 %d 个任务（批次上限 %d），等候队列剩余 %d",
+                            self._batch_no, len(admitted), size, len(self._waiting))
             for tid in admitted:
                 self._dispatch(tid)
             state = self.batch_state()
@@ -956,11 +1033,15 @@ class SmartQueue:
         logger.info("队列已暂停，%d 个任务挂起", n)
         return n
 
-    def resume_all(self, force_unload: bool = False) -> int:
+    def resume_all(self, force_unload: bool = True) -> int:
         """恢复队列：清除暂停标记，把所有 paused 任务重新入队。
 
-        force_unload=True 时走一次任务修复：强制卸载闲置大模型（不打断在跑任务）、
-        解除批次死锁、重建工作线程并预热工作模型，做到「一键恢复且立即续跑」。
+        v1.1.7：恢复默认接入「任务修复」（force_unload 默认 True）——
+        暂停期间可能出现 ffmpeg 卡死、批次闸门死锁、显存被闲置 LLM 占用等情况，
+        直接简单重新入队往往恢复后仍不动。走 repair 可一次完成：
+        强制卸载闲置大模型（不打断在跑任务）→ 强杀卡住的提取进程 → 解除批次死锁
+        → 中间态任务归位 → 重建工作线程 → 预热工作模型 → 立即续跑。
+        需要「仅放行、不做修复」时可显式传 force_unload=False。
         """
         if force_unload:
             report = self.repair(force_unload=True, restart_workers=True,
@@ -1005,6 +1086,82 @@ class SmartQueue:
         self._sweep_batch()
         return count
 
+    def clear_pending(self, sources=None, delete=False) -> int:
+        """清掉「尚未开始执行」的任务，用于撤销误扫产生的一堆排队任务。
+
+        - sources：仅处理 meta.source 命中这些来源的任务（如 {"scan", "scan_transcribe"}）；
+          传 None 表示不区分来源。
+        - delete：True 直接删除数据库记录；False 仅标记为 cancelled（默认，便于回溯）。
+        正在运行的任务不受影响（需要硬中断请用 cancel_all）。
+        返回受影响任务数。
+        """
+        src_set = set(sources) if sources else None
+
+        def _match(tid) -> bool:
+            if src_set is None:
+                return True
+            try:
+                return db.task_meta(tid).get("source") in src_set
+            except Exception:
+                return False
+
+        targets = []
+        # 1) 等候队列中的任务 + 数据库里 pending 的任务
+        with self._batch_lock:
+            waiting = list(self._waiting)
+        for tid in waiting:
+            if tid in self._running_tasks:
+                continue
+            if _match(tid):
+                targets.append(tid)
+        for row in db.list_tasks_by_status(["pending"]):
+            tid = row["id"]
+            if tid in self._running_tasks or tid in targets:
+                continue
+            if _match(tid):
+                targets.append(tid)
+        if not targets:
+            return 0
+
+        drop = set(targets)
+        # 2) 置为 cancelled（或删除记录）
+        now = time.time()
+        with db.db() as conn:
+            for tid in targets:
+                if delete:
+                    conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET status='cancelled', error='用户取消扫描任务', updated_at=? WHERE id=?",
+                        (now, tid))
+        # 3) 从等候队列 / 就绪队列中摘掉
+        with self._batch_lock:
+            self._waiting = [t for t in self._waiting if t not in drop]
+            self._waiting_set = set(self._waiting)
+            self._batch_members = [t for t in self._batch_members if t not in drop]
+            drained = []
+            while True:
+                try:
+                    tid = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                if tid is None:
+                    self._q.put(None)
+                    continue
+                if tid in drop:
+                    self._in_flight.discard(tid)
+                else:
+                    drained.append(tid)
+            for tid in drained:
+                self._q.put(tid)
+        try:
+            self._sweep_batch()
+        except Exception:
+            pass
+        self._emit("task_update", {"bulk": "scan_cleared", "count": len(targets)})
+        logger.info("已清理扫描排队任务 %d 个（delete=%s sources=%s）", len(targets), delete, sources)
+        return len(targets)
+
     def clear_all(self) -> int:
         """清空全部任务与字幕记录（仅删除记录，不影响已生成字幕文件）。返回删除任务数。"""
         with self._batch_lock:
@@ -1031,8 +1188,10 @@ class SmartQueue:
                 if db.get_setting("queue_paused", False):
                     time.sleep(1)
                     continue
-                # staged 模式：动态管理 LLM 容器显存（转录时停 Sakura，全部转录完再启动翻译）
-                if self._phase_mode() == "staged" and not self.is_parallel():
+                # 阶段闸门：sync 按批次阶段推进；staged 按「先转录后翻译」两阶段推进
+                if self.mode() == "sync":
+                    self._sync_checkpoint()
+                elif self._phase_mode() == "staged" and not self.is_parallel():
                     self._staged_checkpoint()
                 try:
                     task_id = self._q.get(timeout=2)
@@ -1310,6 +1469,84 @@ class SmartQueue:
         except Exception as e:
             logger.warning("staged checkpoint 异常: %s", e)
 
+    # ---------- v1.1.11 批内阶段同步（sync） ----------
+    def _sync_prepare(self, stage: str):
+        """阶段切换时一次性准备目标模型，避免整批每条任务各切一次模型。"""
+        try:
+            if stage == "translate":
+                llm_manager.prepare_for("translate")
+            elif stage in ("review", "polish"):
+                llm_manager.prepare_for("polish")
+        except Exception as e:
+            logger.warning("sync 阶段模型预热失败（不阻断）: %s", e)
+
+    @staticmethod
+    def _sync_stage_of(counts: dict):
+        """按批次状态分布推断当前阶段，返回 (stage, 该阶段需提交的状态元组)。
+
+        阶段推进铁律：只要上一环节还有任务在跑，就锁死在当前阶段，
+        绝不允许「有的任务已进校对、有的还在翻译」的跨阶段混跑。
+        """
+        def n(*names):
+            return sum(int(counts.get(x, 0) or 0) for x in names)
+
+        if n("pending", "extracting", "transcribing", "checking") > 0:
+            return "transcribe", ()
+        if n(TRANSLATING) > 0:                        # 翻译未全批跑完
+            return "translate", (TRANSCRIBED,)
+        if n("checking_translation") > 0:             # 校对未全批跑完
+            return "review", (TRANSLATED,)
+        if n("polishing") > 0:                        # 润色未全批跑完
+            return "polish", (REVIEWED,)
+        if n(TRANSCRIBED) > 0:
+            return "translate", (TRANSCRIBED,)
+        if n(TRANSLATED) > 0:
+            return "review", (TRANSLATED,)
+        if n(REVIEWED) > 0:
+            return "polish", (REVIEWED,)
+        return None, ()
+
+    def _sync_checkpoint(self):
+        """批内阶段同步闸门：整批按 转录 → 翻译 → 校对 → 润色 顺序推进。
+
+        - 整批到达同一阶段边界后，才把该阶段全部成员一次性提交；
+        - 阶段切换时只准备一次目标模型（转录阶段则卸载 LLM 让位给 ASR）。
+        """
+        try:
+            counts = self._batch_status_counts()
+            if not counts:
+                return
+            stage, submit_status = self._sync_stage_of(counts)
+            if stage is None:
+                self._sync_stage = None
+                self._translate_submitted.clear()
+                return
+
+            if stage == "transcribe":
+                if not self._sakura_stopped and self._sakura_running():
+                    if self._stop_sakura():
+                        self._sakura_stopped = True
+            if self._sync_stage != stage:
+                logger.info("sync 阶段闸门：%s → %s（批次状态 %s）",
+                            self._sync_stage, stage,
+                            {k: v for k, v in counts.items() if v})
+                self._sync_stage = stage
+                if stage != "transcribe":
+                    self._sakura_stopped = False   # LLM 阶段：允许下批转录时重新卸载
+                self._sync_prepare(stage)
+            if not submit_status:
+                return
+            members = self._batch_member_ids()
+            for r in db.list_tasks_by_status(list(submit_status)):
+                tid = r["id"]
+                if tid not in members:
+                    continue
+                if tid in self._in_flight or tid in self._running_tasks:
+                    continue
+                self.submit(tid)
+        except Exception as e:
+            logger.warning("sync checkpoint 异常: %s", e)
+
     # ---------- 主流程 ----------
     @staticmethod
     def _interrupt_check(task_id) -> bool:
@@ -1337,6 +1574,20 @@ class SmartQueue:
             if task_mode == "transcribe_only":
                 self._transcribe_only(task_id, video_path, cfg)
                 return
+
+            # v1.1.11 sync（批内阶段同步）：按任务所处阶段只执行一个环节，
+            # 必须放在「已有目标字幕则跳过」之前，否则 translated/reviewed 会被误判完成
+            if self.mode() == "sync":
+                sync_srt = _srt_path(video_path, cfg["subtitle_suffix"])
+                if task["status"] == TRANSCRIBED:
+                    self._translate_from_transcript(task_id, video_path, sync_srt, cfg)
+                    return
+                if task["status"] == TRANSLATED:
+                    self._review_stage(task_id, video_path, cfg)
+                    return
+                if task["status"] == REVIEWED:
+                    self._polish_stage(task_id, video_path, cfg)
+                    return
 
             if not _file_exists(video_path):
                 self._fail(task_id, "视频文件不存在（可能已被移动/删除）",
@@ -1488,9 +1739,10 @@ class SmartQueue:
                                report={"note": "source==target, no translation"})
             self._emit("task_done", {"id": task_id, "status": "done"})
             llm_manager.unload_all()
+            return
 
-        # staged 两阶段模式：转录完成即停，等待集体翻译
-        if self._phase_mode() == "staged":
+        # staged 两阶段 / sync 批内阶段同步：转录完成即停，等待整批进入翻译阶段
+        if self.mode() == "sync" or (self._phase_mode() == "staged" and not self.is_parallel()):
             transcribe.release_model()  # 释放 ASR 显存，让位给翻译阶段 LLM
             db.update_task(task_id, status=TRANSCRIBED, stage="transcribed", progress=56,
                            error="转录完成，等待翻译阶段")
@@ -1523,6 +1775,7 @@ class SmartQueue:
             self._exit_model_group("translate")
         db.update_task_meta(
             task_id,
+            translate_model=trans_result.get("model_name", ""),
             tokens_in=trans_result.get("tokens_in", 0),
             tokens_out=trans_result.get("tokens_out", 0),
             translate_tokens_per_sec=round(trans_result.get("tokens_per_sec", 0), 2),
@@ -1555,6 +1808,16 @@ class SmartQueue:
                                        "suggestions": ["检查翻译模型（llm_model）是否支持该语言对，或改用更强模型重跑"]})
             self._fail(task_id, f"翻译未生效（{ratio:.0%} 条目仍为原文）",
                        suggestion="字幕未真正翻译，已归档到「质检未通过字幕目录」，建议更换翻译模型后重跑")
+            return
+
+        # v1.1.11 sync：翻译阶段到此为止，落盘后等整批一起进校对阶段
+        if self.mode() == "sync":
+            from .pipeline.srt_utils import write_srt
+            write_srt(segments, target_srt)
+            db.update_task(task_id, status=TRANSLATED, stage="translated", progress=88,
+                           error="翻译完成，等待校对阶段")
+            self._emit("task_translated", {"id": task_id, "status": TRANSLATED})
+            transcribe.release_model()
             return
 
         # 翻译校对（review 模型组：与翻译/asr 互斥）
@@ -1625,6 +1888,113 @@ class SmartQueue:
         except Exception as e:
             logger.exception("staged 翻译阶段失败")
             self._fail_with_advice(task_id, str(e))
+
+    # ---------- v1.1.11 sync：独立校对 / 润色阶段 ----------
+    def _load_translated_srt(self, task_id, video_path, target_srt):
+        """从磁盘读回译文字幕：原文优先用 .transcript.srt 对齐，译文字段由译文行填充。
+
+        分阶段执行后不再持有翻译时的内存 segments，必须从落地文件还原，
+        否则 quality_check.review_translation 会因 translated 为空判「无译文可校对」。
+        """
+        from pathlib import Path
+        from .pipeline.srt_utils import load_srt
+        segs = load_srt(target_srt)
+        if not segs:
+            return []
+        try:
+            tsrt = str(Path(video_path).with_suffix(".transcript.srt"))
+            if _file_exists(tsrt):
+                src = load_srt(tsrt)
+                if len(src) == len(segs):
+                    for a, b in zip(segs, src):
+                        b.translated = a.text
+                    return src
+        except Exception:
+            logger.debug("还原原文失败（忽略，直接用译文自比对）", exc_info=True)
+        for s in segs:
+            s.translated = s.text
+        return segs
+
+    def _review_stage(self, task_id, video_path, cfg):
+        """sync 校对阶段：对整批已翻译字幕统一做翻译质检，完成后置 reviewed。"""
+        from .pipeline.srt_utils import write_srt
+        target_srt = _srt_path(video_path, cfg["subtitle_suffix"])
+        if not _file_exists(target_srt):
+            self._fail(task_id, "译文字幕不存在，无法校对",
+                       suggestion="请重试该任务（重新翻译）")
+            return
+        segments = self._load_translated_srt(task_id, video_path, target_srt)
+        if not segments:
+            self._fail(task_id, "译文字幕为空或解析失败",
+                       suggestion="请重试该任务（重新翻译）")
+            return
+        self._set_stage(task_id, "checking_translation", 92)
+        self._enter_model_group("review")
+        try:
+            llm_manager.prepare_for("polish")
+            model_name = db.task_meta(task_id).get("translate_model") or cfg["llm_model"]
+            review = quality_check.review_translation(segments, model_name)
+            db.update_task_meta(task_id, translation_score=review.score)
+            write_srt(segments, target_srt)
+            released = False
+            if not review.passed:
+                logger.warning("翻译校对未通过: %s", review.issues)
+                if self._is_enhanced_flow(task_id):
+                    db.create_subtitle(task_id, video_path, target_srt, "translated",
+                                       status="needs_review", lang=cfg["target_lang"],
+                                       score=review.score,
+                                       report={"issues": review.issues[:20],
+                                               "suggestions": review.suggestions[:10],
+                                               "enhanced_released": True})
+                    db.update_task_meta(task_id,
+                                        enhanced_note=f"翻译质检未通过（{review.score:.0f} 分），"
+                                                      f"增强流程已放行并保留在视频原目录")
+                    released = True
+                else:
+                    archived = self._archive_review_failed(task_id, video_path, target_srt, "translated")
+                    db.create_subtitle(task_id, video_path, archived, "translated",
+                                       status="needs_review", lang=cfg["target_lang"],
+                                       score=review.score,
+                                       report={"issues": review.issues[:20],
+                                               "suggestions": review.suggestions[:10]})
+                    self._fail(task_id, "翻译质检未通过",
+                               suggestion=("翻译字幕已归档到「质检未通过字幕目录」"
+                                           if archived != target_srt
+                                           else "翻译字幕已保存在视频同目录") + "，可人工修改后重新入队")
+                    return
+            if not released:
+                db.create_subtitle(task_id, video_path, target_srt, "translated",
+                                   status="ok", lang=cfg["target_lang"], score=review.score,
+                                   report={"passed": True})
+        finally:
+            self._exit_model_group("review")
+
+        if not cfg.get("polish_enabled", False):
+            db.update_task(task_id, status="done", stage="done", progress=100, error="")
+            self._emit("task_done", {"id": task_id, "status": "done"})
+            llm_manager.unload_all()
+            return
+        db.update_task(task_id, status=REVIEWED, stage="reviewed", progress=96,
+                       error="校对完成，等待润色阶段")
+        self._emit("task_reviewed", {"id": task_id, "status": REVIEWED})
+
+    def _polish_stage(self, task_id, video_path, cfg):
+        """sync 润色阶段：对整批已校对字幕统一润色，完成后置 done。"""
+        target_srt = _srt_path(video_path, cfg["subtitle_suffix"])
+        if cfg.get("polish_enabled", False):
+            if not _file_exists(target_srt):
+                self._fail(task_id, "译文字幕不存在，无法润色",
+                           suggestion="请重试该任务（重新翻译）")
+                return
+            segments = self._load_translated_srt(task_id, video_path, target_srt)
+            if not segments:
+                self._fail(task_id, "译文字幕为空或解析失败",
+                           suggestion="请重试该任务（重新翻译）")
+                return
+            self._polish_step(task_id, video_path, cfg, segments)
+        db.update_task(task_id, status="done", stage="done", progress=100, error="")
+        self._emit("task_done", {"id": task_id, "status": "done"})
+        llm_manager.unload_all()
 
     def _translate_only(self, task_id, video_path, target_srt, cfg):
         """仅翻译已有外文字幕（跳过转录）。"""
@@ -1937,16 +2307,63 @@ def _polish_path(video_path, suffix):
     return str(p.with_suffix(suffix + ".rs.srt"))
 
 
-def scan_polish_jobs(directory):
+def _video_of_subtitle(srt_path, suffix):
+    """v1.1.7：由字幕反查同目录原视频，用于对润色任务做时长过滤。
+
+    xxx.mkv.zh.srt / xxx.zh.srt 都可能出现，逐个尝试视频扩展名匹配；
+    找不到（或同名多个）返回 None，调用方按「无法判定」放行。
+    """
+    from pathlib import Path
+    p = Path(srt_path)
+    name = p.name
+    suffix = suffix or ".zh"
+    low = name.lower()
+    if low.endswith((suffix + ".srt").lower()):
+        stem = name[: -(len(suffix) + 4)]
+    elif low.endswith(".srt"):
+        stem = name[:-4]
+    else:
+        return None
+    exts = [e.strip().lower() for e in str(db.get_setting("video_exts")).split(",") if e.strip()]
+    for ext in exts[:4]:
+        cand = p.with_name(stem + ext)
+        if cand.exists():
+            return str(cand)
+    return None
+
+
+def _scan_cancelled(cancel_cb):
+    if cancel_cb is None:
+        return False
+    try:
+        return bool(cancel_cb())
+    except Exception:
+        return False
+
+
+def scan_polish_jobs(directory, cancel_cb=None, on_progress=None):
     """一键扫描：找 directory 下所有待润色的中文字幕（.zh.srt 且无对应 .zh.rs.srt），批量入队。
 
     返回 (enqueued, skipped, total)：入队数 / 已有润色跳过数 / 中文字幕总数。
+    v1.1.6：cancel_cb() 返回 True 时立即停止扫描并返回当前累计值。
+    v1.1.7：能定位到原视频且超过「最长视频时长」的，同样不计入任务。
     """
     from pathlib import Path
+    from .watcher import duration_exceeded, max_video_minutes
+    limit = max_video_minutes()
     target_suffix = db.get_setting("subtitle_suffix")
     rs_suffix = target_suffix + ".rs"
     total = enqueued = skipped = 0
-    for srt in sorted(Path(directory).rglob("*.srt")):
+    processed = 0
+    # 惰性遍历（不做 sorted）：大目录先全量枚举再排序会让取消点失效，瞬间也占满内存
+    for srt in Path(directory).rglob("*.srt"):
+        processed += 1
+        if processed % 100 == 0:
+            if _scan_cancelled(cancel_cb):
+                logger.info("润色扫描已取消：%s（检查 %s 个字幕，入队 %s 个）", directory, processed, enqueued)
+                return enqueued, skipped, total
+            if on_progress:
+                on_progress(processed, enqueued, str(srt))
         name = srt.name.lower()
         if not name.endswith(target_suffix + ".srt") or name.endswith(rs_suffix + ".srt"):
             continue
@@ -1959,6 +2376,15 @@ def scan_polish_jobs(directory):
             if db.get_task_by_path(str(srt), active_only=True):
                 skipped += 1
                 continue
+            # v1.1.7：能反查到原视频且超时长上限的，润色任务也不入队
+            if limit > 0:
+                vid = _video_of_subtitle(srt, target_suffix)
+                if vid:
+                    over, _dur = duration_exceeded(vid, limit)
+                    if over:
+                        skipped += 1
+                        logger.info("跳过超长视频的润色任务（> %s 分钟）: %s", limit, vid)
+                        continue
             task_id = db.create_task(str(srt), srt.name)
             db.update_task_meta(task_id, source="scan_polish", mode="polish")
             if not db.get_setting("queue_paused", False):
@@ -1969,30 +2395,51 @@ def scan_polish_jobs(directory):
     return enqueued, skipped, total
 
 
-def scan_transcribe_jobs(directory):
+def scan_transcribe_jobs(directory, cancel_cb=None, on_progress=None):
     """一键扫描只转录：找 directory 下所有尚无转录字幕的视频，只转录不翻译。
 
     返回 (enqueued, skipped, total)：入队数 / 已跳过数 / 视频总数。
+    v1.1.6：cancel_cb() 返回 True 时立即停止扫描并返回当前累计值。
+    v1.1.7：超过「最长视频时长」的视频不计入任务，归入 skipped。
     """
     from pathlib import Path
-    from .watcher import is_video_file
+    from .watcher import is_video_file, duration_exceeded, max_video_minutes
+    limit = max_video_minutes()
     total = enqueued = skipped = 0
-    for f in sorted(Path(directory).rglob("*")):
+    processed = 0
+    # 惰性遍历（不做 sorted）：理由同 scan_polish_jobs，保证取消能及时生效
+    for f in Path(directory).rglob("*"):
+        processed += 1
+        if processed % 100 == 0:
+            if _scan_cancelled(cancel_cb):
+                logger.info("转录扫描已取消：%s（检查 %s 个文件，入队 %s 个）", directory, processed, enqueued)
+                return enqueued, skipped, total
+            if on_progress:
+                on_progress(processed, enqueued, str(f))
         if not f.is_file() or not is_video_file(str(f), db.get_setting("video_exts")):
             continue
         total += 1
         # 已有转录字幕 / 已有中文字幕 / 进行中任务 → 跳过
         if _file_exists(str(Path(f).with_suffix(".transcript.srt"))):
             skipped += 1
+            _add_scan_skip("existing")   # v1.1.8：已有转录字幕计入「已有字幕」
             continue
         if _file_exists(_srt_path(str(f), db.get_setting("subtitle_suffix"))):
             skipped += 1
+            _add_scan_skip("existing")   # v1.1.8：已有字幕计数
             continue
         if db.get_task_by_path(str(f), active_only=True):
             skipped += 1
             continue
+        # v1.1.7：超长视频排除在任务之外
+        over, dur = duration_exceeded(str(f), limit)
+        if over:
+            skipped += 1
+            logger.info("跳过超长视频（%.0f 分钟 > %s 分钟上限）: %s", dur / 60.0, limit, f)
+            continue
         task_id = db.create_task(str(f), f.name)
-        db.update_task_meta(task_id, source="scan_transcribe", mode="transcribe_only")
+        db.update_task_meta(task_id, source="scan_transcribe", mode="transcribe_only",
+                            duration=round(float(dur or 0), 1))
         if not db.get_setting("queue_paused", False):
             smart_queue.submit(task_id)
         smart_queue._emit("task_new", {"id": task_id, "path": str(f), "name": f.name})
@@ -2000,21 +2447,34 @@ def scan_transcribe_jobs(directory):
     return enqueued, skipped, total
 
 
-def scan_translate_jobs(directory):
+def scan_translate_jobs(directory, cancel_cb=None, on_progress=None):
     """一键扫描转录字幕只翻译：找 directory 下已有外文字幕（任意语言）的视频，只翻译不转录。
 
     返回 (enqueued, skipped, total)：入队数 / 已跳过数 / 视频总数。
+    v1.1.6：cancel_cb() 返回 True 时立即停止扫描并返回当前累计值。
+    v1.1.7：超过「最长视频时长」的视频不计入任务，归入 skipped。
     """
     from pathlib import Path
-    from .watcher import is_video_file
+    from .watcher import is_video_file, duration_exceeded, max_video_minutes
+    limit = max_video_minutes()
     total = enqueued = skipped = 0
-    for f in sorted(Path(directory).rglob("*")):
+    processed = 0
+    # 惰性遍历（不做 sorted）：理由同 scan_polish_jobs，保证取消能及时生效
+    for f in Path(directory).rglob("*"):
+        processed += 1
+        if processed % 100 == 0:
+            if _scan_cancelled(cancel_cb):
+                logger.info("翻译扫描已取消：%s（检查 %s 个文件，入队 %s 个）", directory, processed, enqueued)
+                return enqueued, skipped, total
+            if on_progress:
+                on_progress(processed, enqueued, str(f))
         if not f.is_file() or not is_video_file(str(f), db.get_setting("video_exts")):
             continue
         total += 1
         # 已有目标中文字幕 → 跳过
         if _file_exists(_srt_path(str(f), db.get_setting("subtitle_suffix"))):
             skipped += 1
+            _add_scan_skip("existing")   # v1.1.8：已有字幕计数
             continue
         ext_srt = _find_existing_subtitle(str(f))
         if not ext_srt:
@@ -2023,14 +2483,30 @@ def scan_translate_jobs(directory):
         if db.get_task_by_path(str(f), active_only=True):
             skipped += 1
             continue
+        # v1.1.7：超长视频排除在任务之外
+        over, dur = duration_exceeded(str(f), limit)
+        if over:
+            skipped += 1
+            logger.info("跳过超长视频（%.0f 分钟 > %s 分钟上限）: %s", dur / 60.0, limit, f)
+            continue
         task_id = db.create_task(str(f), f.name)
         db.update_task_meta(task_id, source="scan_translate", mode="translate_only",
+                            duration=round(float(dur or 0), 1),
                             translate_note=f"已有外文字幕 {Path(ext_srt).name}")
         if not db.get_setting("queue_paused", False):
             smart_queue.submit(task_id)
         smart_queue._emit("task_new", {"id": task_id, "path": str(f), "name": f.name})
         enqueued += 1
     return enqueued, skipped, total
+
+
+def _add_scan_skip(kind, n=1):
+    """v1.1.8：累加本次扫描的跳过明细（existing/duration/active），供首页统计展示。"""
+    try:
+        from .watcher import LAST_SCAN_SKIP
+        LAST_SCAN_SKIP[kind] = int(LAST_SCAN_SKIP.get(kind, 0)) + n
+    except Exception:
+        pass
 
 
 def _find_existing_subtitle(video_path):
@@ -2065,15 +2541,24 @@ def _find_existing_subtitle(video_path):
 smart_queue = SmartQueue()
 
 
-def enqueue_path(video_path: str, source: str = "manual"):
+def enqueue_path(video_path: str, source: str = "manual", duration: float = None,
+                 limit_minutes: int = None, stats: dict = None):
     """入队一个新视频：去重 + 创建任务 + 提交队列。返回 task_id 或 None。
 
     扫描分类（v1.4.8）：
     - 已有中文字幕 → skip（不入队）
     - 有外文字幕（如日语）→ 任务标记 translate_only，只翻译不转录
     - 无字幕 → 完整流水线（转录→质检→翻译→质检）
+
+    v1.1.7：超过「最长视频时长」（max_video_minutes，默认 240 分钟）的视频直接排除，
+    不创建任务。duration 传入时复用调用方已探测的时长，避免同一文件二次 ffprobe；
+    stats 传入字典时回填 skipped_duration / limit_minutes，供批量入口汇总提示。
     """
-    from .watcher import should_skip, classify_video
+    from .watcher import should_skip, classify_video, max_video_minutes
+    limit = max_video_minutes() if limit_minutes is None else max(0, int(limit_minutes))
+    if stats is not None:
+        stats["limit_minutes"] = limit
+        stats.setdefault("skipped_duration", 0)
     if not _file_exists(video_path):
         return None
     if should_skip(video_path):
@@ -2081,13 +2566,28 @@ def enqueue_path(video_path: str, source: str = "manual"):
     action, reason = classify_video(video_path)
     if action == "skip":
         return None
+    if duration is not None and duration > 0 and limit > 0 and duration > limit * 60:
+        logger.info("跳过超长视频（%.0f 分钟 > %s 分钟上限）: %s",
+                    duration / 60.0, limit, video_path)
+        if stats is not None:
+            stats["skipped_duration"] += 1
+        return None
     existing = db.get_task_by_path(video_path, active_only=True)
     if existing:
         return existing["id"]
     from pathlib import Path
+    # 时长用于任务元信息；limit>0 时顺便作为超长判定依据（探测失败按放行处理）
+    if duration is None:
+        duration = extract_audio.probe_duration(video_path)
+    if limit > 0 and duration and duration > limit * 60:
+        logger.info("跳过超长视频（%.0f 分钟 > %s 分钟上限）: %s",
+                    duration / 60.0, limit, video_path)
+        if stats is not None:
+            stats["skipped_duration"] += 1
+        return None
     task_id = db.create_task(video_path, Path(video_path).name)
     meta = {"source": source, "mode": action,
-            "duration": round(extract_audio.probe_duration(video_path), 1)}  # 电影总时长（秒）
+            "duration": round(float(duration or 0), 1)}  # 电影总时长（秒）
     if action == "translate_only":
         meta["translate_note"] = reason
     db.update_task_meta(task_id, **meta)

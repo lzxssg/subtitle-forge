@@ -16,7 +16,7 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # llama-swap 中注册的全部 LLM 模型（转录阶段全部卸载，把显存让给 ASR）
 DEFAULT_SWAP_MODELS = "sakura-gpu,qwen3_8b,review-35b,35B-A3B,glm4_9b"
 
-APP_VERSION = "1.1.5"
+APP_VERSION = "1.1.13"
 
 DEFAULTS = {
     "watch_dirs": os.getenv("WATCH_DIRS", "/Media"),
@@ -24,6 +24,9 @@ DEFAULTS = {
     "scan_interval_value": int(os.getenv("SCAN_INTERVAL_VALUE", "60")),
     "scan_interval_unit": os.getenv("SCAN_INTERVAL_UNIT", "minutes"),
     "video_exts": os.getenv("VIDEO_EXTS", ".mp4,.mkv,.avi,.mov,.wmv,.flv,.webm,.ts,.m2ts"),
+    # v1.1.7: 视频时长上限（分钟）——超过该时长的视频不进入任务队列（0 = 不限制）。
+    # 长视频转录/翻译耗时极长且易撞超时，默认排除 240 分钟以上的内容。
+    "max_video_minutes": int(os.getenv("MAX_VIDEO_MINUTES", "240")),
     "asr_model": os.getenv("ASR_MODEL", "small"),
     "asr_device": os.getenv("ASR_DEVICE", "auto"),
     "asr_compute_type": os.getenv("ASR_COMPUTE_TYPE", "int8"),
@@ -131,7 +134,7 @@ DEFAULT_SWAP_MODELS = "sakura-gpu,qwen3_8b,review-35b,35B-A3B,glm4_9b"
 # 可被 Web 界面修改的键
 EDITABLE_KEYS = [
     "watch_dirs", "scan_interval_minutes", "scan_interval_value", "scan_interval_unit",
-    "video_exts",
+    "video_exts", "max_video_minutes",
     "asr_model", "asr_device", "asr_compute_type", "asr_cpu_threads", "asr_language", "asr_provider",
     "llm_base_url", "llm_api_key", "llm_model", "llm_temperature",
     "review_base_url", "review_api_key", "review_model",
