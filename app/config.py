@@ -16,7 +16,7 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # llama-swap 中注册的全部 LLM 模型（转录阶段全部卸载，把显存让给 ASR）
 DEFAULT_SWAP_MODELS = "sakura-gpu,qwen3_8b,review-35b,35B-A3B,glm4_9b"
 
-APP_VERSION = "1.1.14"
+APP_VERSION = "1.1.16"
 
 DEFAULTS = {
     "watch_dirs": os.getenv("WATCH_DIRS", "/Media"),
@@ -92,6 +92,13 @@ DEFAULTS = {
     "hf_proxy": os.getenv("HF_PROXY", ""),
     # v1.6.9: 润色作为流水线最后一步（转录→质检→翻译→质检→润色），输出 .zh.rs.srt 并存
     "polish_enabled": os.getenv("POLISH_ENABLED", "false").lower() == "true",
+    # v1.1.15: 校对与中间环节开关（快翻用）——
+    #   fast_mode              总开关：一键关掉转录质检/翻译校对/润色，只保留「提取音频→转录→翻译」
+    #   transcript_check_enabled 转录质检（规则统计，快；关掉可省 1 个环节与少量耗时）
+    #   review_enabled         翻译后 LLM 校对（慢：要调一次大模型抽样打分）
+    "fast_mode": os.getenv("FAST_MODE", "false").lower() == "true",
+    "transcript_check_enabled": os.getenv("TRANSCRIPT_CHECK_ENABLED", "true").lower() == "true",
+    "review_enabled": os.getenv("REVIEW_ENABLED", "true").lower() == "true",
     # v2.1.0: 调度模式
     #   staged   = 单模型·环节串行（全部转录完再集体翻译，同一时刻只驻留一个大模型）
     #   pipeline = 单模型·任务串行（一个任务走完全流程再进下一个）
@@ -126,6 +133,16 @@ DEFAULTS = {
     "webhook_events": os.getenv("WEBHOOK_EVENTS", "ItemAdded,ItemUpdated,LibraryNew"),
     "webhook_media_types": os.getenv("WEBHOOK_MEDIA_TYPES", "Movie,Episode"),
     "webhook_path_map": os.getenv("WEBHOOK_PATH_MAP", ""),
+    # v1.1.16: 工作时段调度——按每日窗口运行 + 连续工作后强制休息，兼顾显卡寿命与峰谷电价
+    #   work_schedule_enabled   总开关
+    #   work_schedule_windows   允许运行的时间段，支持 22:00-08:00 跨夜写法；留空=全天允许（仅按循环休息）
+    #   work_schedule_work_minutes / rest_minutes  连续工作 N 分钟后休息 M 分钟（work=0 关闭循环休息）
+    #   work_schedule_unload_on_rest  休息期间卸载驻留大模型，进一步降功耗与温度
+    "work_schedule_enabled": os.getenv("WORK_SCHEDULE_ENABLED", "false").lower() == "true",
+    "work_schedule_windows": os.getenv("WORK_SCHEDULE_WINDOWS", ""),
+    "work_schedule_work_minutes": int(os.getenv("WORK_SCHEDULE_WORK_MINUTES", "180")),
+    "work_schedule_rest_minutes": int(os.getenv("WORK_SCHEDULE_REST_MINUTES", "30")),
+    "work_schedule_unload_on_rest": os.getenv("WORK_SCHEDULE_UNLOAD_ON_REST", "true").lower() == "true",
 }
 
 # llama-swap 中注册的全部 LLM 模型（转录阶段全部卸载，把显存让给 ASR）
@@ -141,7 +158,7 @@ EDITABLE_KEYS = [
     "source_lang", "target_lang", "max_workers", "task_workers", "batch_size",
     "llm_timeout", "llm_max_attempts", "llm_total_budget",
     "transcribe_workers", "translate_workers", "polish_workers", "smart_queue", "translate_only",
-    "polish_enabled",
+    "polish_enabled", "review_enabled", "transcript_check_enabled", "fast_mode",
     "skip_existing_subtitle", "subtitle_suffix",
     "transcript_quality_threshold", "translation_quality_threshold", "review_sample_count",
     "monitor_enabled", "auto_retry_failed", "file_stable_seconds", "translation_speed",

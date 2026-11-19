@@ -441,6 +441,7 @@ button.small.active { background: var(--accent); color: #fff; }
       <button class="tab" data-tab="tab-asr" onclick="switchTab('tab-asr',this)">音频识别</button>
       <button class="tab" data-tab="tab-queue" onclick="switchTab('tab-queue',this)">队列与字幕</button>
       <button class="tab" data-tab="tab-webhook" onclick="switchTab('tab-webhook',this)">媒体联动</button>
+      <button class="tab" data-tab="tab-schedule" onclick="switchTab('tab-schedule',this)">工作时段</button>
       <button class="tab" data-tab="tab-log" onclick="switchTab('tab-log',this)">运行日志</button>
     </div>
 
@@ -588,9 +589,31 @@ button.small.active { background: var(--accent); color: #fff; }
       <div class="form-row"><label>翻译校对阈值</label><input type="number" id="cfg_translation_quality_threshold" min="0" max="100"></div>
       <div class="form-row"><label>未通过校验字幕归档</label><select id="cfg_review_archive_enabled"><option value="true">开启（转移到「未通过校验字幕」目录）</option><option value="false">关闭（保留在视频原目录）</option></select><div class="form-hint">目标目录在「翻译/校对大模型」页设置；开启后未通过质检的字幕会被移出视频目录，不再进入下一环节。</div></div>
       <div class="form-row"><label>校对抽样条数</label><input type="number" id="cfg_review_sample_count" min="4" max="60"><div class="form-hint">每次翻译后抽多少条送质检大模型打分（4~60，默认 12）；规则预检拦截时自动跳过</div></div>
-      <div class="form-row"><label>仅翻译已有字幕</label><select id="cfg_translate_only"><option value="false">否（完整流水线：转录+翻译）</option><option value="true">是（跳过转录，只翻译外文字幕）</option></select></div>
+      <div class="form-row"><label>快翻模式</label><select id="cfg_fast_mode"><option value="false">关闭（按下方各项独立开关执行）</option><option value="true">开启（只保留 提取音频→转录→翻译，其余环节全部跳过）</option></select><div class="form-hint"><b>快翻总开关</b>：开启后强制关闭「转录质检」「翻译后校对」「大模型润色」，翻译完成直接落盘交付；下方单项设置仍然保留，关闭快翻后按单项生效。想连转录也省掉，请再开启「仅翻译已有字幕」（需视频同目录已有 <b>.transcript.srt</b> 或目标语言字幕）。</div></div>
+      <div class="form-row"><label>转录质检</label><select id="cfg_transcript_check_enabled"><option value="true">开启（规则校验时间戳/覆盖率/乱码/重复行，未通过判失败）</option><option value="false">关闭（转录完直接进入翻译）</option></select><div class="form-hint">这是纯规则校验、不调大模型，耗时很短；关闭后不做整体打分与阈值判定。<b>但废料拦截强制生效</b>：空白、整段相同台词、重复泛滥、占位文本、覆盖率近似 0 等明显无效转录，一律判失败并归档，绝不会进入翻译阶段。</div></div>
+      <div class="form-row"><label>仅翻译已有字幕</label><select id="cfg_translate_only"><option value="false">否（完整流水线：转录+翻译）</option><option value="true">是（跳过提取音频与转录，只翻译已有字幕）</option></select></div>
+      <div class="form-row"><label>翻译后校对</label><select id="cfg_review_enabled"><option value="true">开启（校对模型抽查打分，未通过则判失败/归档）</option><option value="false">关闭（翻译完直接落盘交付，不调用校对模型）</option></select><div class="form-hint">关闭后翻译完成即写入 <b>.zh.srt</b> 并视为通过，不再抽样送校对模型评分：省一次大模型调用、速度快，但生成的字幕不做质量把关；若同时开启润色，仍会继续润色。</div></div>
       <div class="form-row"><label>翻译后大模型润色</label><select id="cfg_polish_enabled"><option value="true">开启（润色为自然中文，输出 .zh.rs.srt）</option><option value="false">关闭</option></select><div class="form-hint">翻译校对通过后，用校对模型把译文润色成自然地道的中文语境、保持原意；结果写入同目录 <b>.zh.rs.srt</b>，与原翻译 .zh.srt 并存不覆盖。也支持对历史中文字幕一键扫描批量润色。</div></div>
       <div class="hint" style="font-size:12px;color:var(--muted)">完整流水线：扫描 → 转录 → 转录质检 → 翻译 → 翻译校对 →（可选）大模型润色。显存占用参考：RTX 5060 8G 上 sakura 7B 约占用 6.8G，剩余约 1.1G 仅够 small 级 whisper int8。</div>
+    </div>
+
+    <!-- 工作时段调度 -->
+    <div id="tab-schedule" class="tab-panel" style="display:none">
+      <div class="form-row"><label>启用工作时段调度</label><select id="cfg_work_schedule_enabled"><option value="false">关闭（7×24 连续运行）</option><option value="true">开启（仅在下方时段内运行，其余时间自动暂停）</option></select>
+        <div class="form-hint">调度器每 30 秒检查一次：不在时段内 → 暂停队列（进行中任务挂起并保留进度）；到点 → 自动恢复并重载模型。手动点「暂停队列」不会被调度器自动放开。</div></div>
+      <div class="form-row"><label>允许运行时段</label><textarea id="cfg_work_schedule_windows" rows="3" placeholder="22:00-08:00" style="flex:1;min-height:72px;font-family:inherit"></textarea>
+        <div class="form-hint">逗号或换行分隔多个时段，支持跨夜写法。例：<b>22:00-08:00</b>（谷电时段）、<b>22:00-08:00,12:00-14:00</b>（谷电+午间深谷）。留空 = 全天允许，此时只按下方循环休息执行。</div></div>
+      <div class="form-row"><label>连续工作时长</label><input type="number" id="cfg_work_schedule_work_minutes" min="0" max="1440" step="10" style="width:110px"><div class="form-hint">分钟。填 <b>0</b> 关闭循环休息（只在时段结束时停）。建议 150~240：太短会频繁卸载/重载模型，反而拖慢整体吞吐。</div></div>
+      <div class="form-row"><label>每次休息时长</label><input type="number" id="cfg_work_schedule_rest_minutes" min="0" max="720" style="width:110px"><div class="form-hint">分钟。休息期间 GPU 回落到待机温度，建议 20~40 分钟；休息结束后自动续跑。</div></div>
+      <div class="form-row"><label>休息时卸载大模型</label><select id="cfg_work_schedule_unload_on_rest"><option value="true">开启（进一步降功耗与显存占用）</option><option value="false">关闭（保留模型驻留，恢复更快）</option></select></div>
+      <div class="section-divider"></div>
+      <div class="form-row"><label>当前状态</label><div id="workScheduleStatus" style="flex:1;font-size:12px;color:var(--muted)">点击「刷新状态」查看</div></div>
+      <div class="form-row"><label>快捷预设</label><div style="display:flex;gap:6px;flex-wrap:wrap;flex:1">
+        <button type="button" class="mini-btn" onclick="applySchedulePreset('night')">夜间谷电 22:00-08:00</button>
+        <button type="button" class="mini-btn" onclick="applySchedulePreset('cycle')">全天 + 每 3 小时休 30 分</button>
+        <button type="button" class="mini-btn" onclick="applySchedulePreset('off')">关闭调度</button>
+        <button type="button" class="mini-btn" onclick="loadWorkScheduleStatus()">刷新状态</button>
+      </div></div>
     </div>
 
     <!-- 媒体联动 -->
@@ -1699,6 +1722,7 @@ function switchTab(name, btn) {
   btn.classList.add('active'); $(name).style.display = 'block';
   // 进入对应 tab 时自动加载动态内容，避免空白
   if (name === 'tab-log') loadLogs();
+  if (name === 'tab-schedule') loadWorkScheduleStatus();
 }
 function modelEl(id) { return document.getElementById(id); }
 function modelCustom(id) { return document.getElementById(id + '_custom'); }
@@ -1879,6 +1903,9 @@ async function loadConfigForm() {
   $('cfg_translation_quality_threshold').value = c.translation_quality_threshold ?? 70;
   $('cfg_review_sample_count').value = c.review_sample_count ?? 12;
   $('cfg_translate_only').value = c.translate_only ? 'true' : 'false';
+  $('cfg_fast_mode').value = (c.fast_mode === true || c.fast_mode === 'true') ? 'true' : 'false';
+  $('cfg_transcript_check_enabled').value = (c.transcript_check_enabled === false || c.transcript_check_enabled === 'false') ? 'false' : 'true';
+  $('cfg_review_enabled').value = (c.review_enabled === false || c.review_enabled === 'false') ? 'false' : 'true';
   $('cfg_polish_enabled').value = c.polish_enabled === false || c.polish_enabled === 'false' ? 'false' : 'true';
   if ($('cfg_scheduler_mode')) $('cfg_scheduler_mode').value = c.scheduler_mode || 'auto';
   if ($('cfg_review_failed_dir')) $('cfg_review_failed_dir').value = c.review_failed_dir || '';
@@ -1895,9 +1922,74 @@ async function loadConfigForm() {
   if (c.review_base_url) setTimeout(() => refreshLlms('review'), 400);
   if (c.polish_base_url || c.review_base_url || c.llm_base_url) setTimeout(() => refreshLlms('polish'), 700);
 }
+// ---------- 工作时段调度（v1.1.16） ----------
+function renderWorkScheduleStatus(d) {
+  const el = $('workScheduleStatus');
+  if (!el || !d) return;
+  const map = { running:'运行中', off_window:'不在运行时段（已暂停）', cycle_rest:'周期休息中（降温）', manual_paused:'手动暂停（调度不干预）', disabled:'调度未启用', unknown:'等待首次检查' };
+  let html = '状态：<b>' + (map[d.state] || d.state || '-') + '</b>';
+  html += ' · 时段：' + (d.windows && d.windows.length ? d.windows.join(' / ') : '全天');
+  if (d.work_minutes > 0 && d.rest_minutes > 0) html += ' · 节奏：工作 ' + d.work_minutes + ' 分 / 休 ' + d.rest_minutes + ' 分';
+  if (d.next_change_text) html += ' · 下次切换：' + d.next_change_text;
+  html += ' · 队列暂停：' + (d.queue_paused ? '是' : '否');
+  el.innerHTML = html;
+}
+async function loadWorkScheduleForm() {
+  try {
+    const r = await fetch('/api/work_schedule', {cache:'no-store'});
+    const d = await r.json();
+    if ($('cfg_work_schedule_enabled')) $('cfg_work_schedule_enabled').value = d.enabled ? 'true' : 'false';
+    if ($('cfg_work_schedule_windows')) $('cfg_work_schedule_windows').value = (d.windows || []).join('\n');
+    if ($('cfg_work_schedule_work_minutes')) $('cfg_work_schedule_work_minutes').value = d.work_minutes ?? 180;
+    if ($('cfg_work_schedule_rest_minutes')) $('cfg_work_schedule_rest_minutes').value = d.rest_minutes ?? 30;
+    if ($('cfg_work_schedule_unload_on_rest')) $('cfg_work_schedule_unload_on_rest').value = d.unload_on_rest ? 'true' : 'false';
+    renderWorkScheduleStatus(d);
+  } catch (e) {}
+}
+async function loadWorkScheduleStatus() {
+  try {
+    const r = await fetch('/api/work_schedule', {cache:'no-store'});
+    renderWorkScheduleStatus(await r.json());
+    toast('状态已刷新');
+  } catch (e) { toast('刷新失败'); }
+}
+async function saveWorkSchedule() {
+  const v = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+  if (!$('cfg_work_schedule_enabled')) return;
+  const payload = {
+    enabled: v('cfg_work_schedule_enabled') === 'true',
+    windows: v('cfg_work_schedule_windows').trim(),
+    work_minutes: Math.max(0, Number(v('cfg_work_schedule_work_minutes')) || 0),
+    rest_minutes: Math.max(0, Number(v('cfg_work_schedule_rest_minutes')) || 0),
+    unload_on_rest: v('cfg_work_schedule_unload_on_rest') === 'true',
+  };
+  const r = await fetch('/api/work_schedule', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  const d = await r.json();
+  if (d.ok) renderWorkScheduleStatus(d.status);
+  else toast('工作时段保存失败');
+}
+async function applySchedulePreset(mode) {
+  if (mode === 'night') {
+    $('cfg_work_schedule_enabled').value = 'true';
+    $('cfg_work_schedule_windows').value = '22:00-08:00';
+    $('cfg_work_schedule_work_minutes').value = 240;
+    $('cfg_work_schedule_rest_minutes').value = 30;
+  } else if (mode === 'cycle') {
+    $('cfg_work_schedule_enabled').value = 'true';
+    $('cfg_work_schedule_windows').value = '';
+    $('cfg_work_schedule_work_minutes').value = 180;
+    $('cfg_work_schedule_rest_minutes').value = 30;
+  } else {
+    $('cfg_work_schedule_enabled').value = 'false';
+  }
+  await saveWorkSchedule();
+  toast('预设已保存并生效');
+}
 async function saveSettings() {
   // 安全取值：控件不存在时回退默认，避免单个元素缺失导致整个保存链路中断
   const v = id => { const el = document.getElementById(id); return el ? el.value : ''; };
+  // v1.1.16: 工作时段走独立 API，先保存
+  try { await saveWorkSchedule(); } catch (e) {}
   const values = {
     llm_base_url: v('cfg_llm_base_url').trim(),
     llm_api_key: v('cfg_llm_api_key').trim(),
@@ -1943,6 +2035,9 @@ async function saveSettings() {
     transcript_quality_threshold: Number(v('cfg_transcript_quality_threshold')) || 60,
     translation_quality_threshold: Number(v('cfg_translation_quality_threshold')) || 70,
     translate_only: v('cfg_translate_only') === 'true',
+    fast_mode: v('cfg_fast_mode') === 'true',
+    transcript_check_enabled: v('cfg_transcript_check_enabled') === 'true',
+    review_enabled: v('cfg_review_enabled') === 'true',
     polish_enabled: v('cfg_polish_enabled') === 'true',
     scheduler_mode: v('cfg_scheduler_mode') || 'auto',
     review_failed_dir: v('cfg_review_failed_dir').trim(),

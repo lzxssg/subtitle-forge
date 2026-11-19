@@ -162,6 +162,47 @@ def check_transcript(segments, video_duration, detected_lang) -> QualityReport:
     return report
 
 
+def quick_guard(segments, video_duration=None):
+    """转录废料拦截（v1.1.16，强制生效、不可关闭）。
+
+    只做低成本规则判断，专门拦住「明显无效」的转录：空结果、全空白、整段同一句、
+    重复行泛滥、空行占比过高、占位废文本、覆盖率近乎为 0、有效字符与时长严重不匹配。
+    返回拒绝原因字符串；通过则返回 None。
+    即使关闭「转录质检」或开启「快翻模式」，本拦截仍会执行，确保垃圾转录不会进入翻译。
+    """
+    if not segments:
+        return "转录结果为空（无字幕段）"
+    texts = [str(getattr(s, "text", "") or "").strip() for s in segments]
+    nonempty = [t for t in texts if t]
+    if not nonempty:
+        return "所有字幕段均为空白，未识别到任何语音内容"
+    uniq = len(set(nonempty))
+    total = len(nonempty)
+    empty_ratio = 1 - total / len(texts)
+    if empty_ratio > 0.7:
+        return f"空字幕段占 {empty_ratio:.0%}，转录基本无效"
+    if total >= 3 and uniq == 1:
+        return f"整段转录为同一句重复内容（{total} 段完全相同），疑似 ASR 循环/幻觉"
+    dup = 1 - uniq / total
+    if total >= 5 and uniq <= 3 and dup > 0.9:
+        return f"重复行占比 {dup:.0%}（仅 {uniq} 种文本 / {total} 段），疑似 ASR 循环/幻觉"
+    if total >= 5 and dup > 0.9:
+        return f"重复行占比 {dup:.0%}，转录内容几乎无变化，疑似 ASR 失效"
+    ph = sum(1 for t in nonempty if _PLACEHOLDER_RE.search(t))
+    if ph > total * 0.5:
+        return f"占位/废文本段占 {ph / total:.0%}（如“请稍等”），管线异常"
+    if video_duration and video_duration > 0:
+        covered = sum(min(s.end, video_duration) - max(s.start, 0) for s in segments if s.end > s.start)
+        cov = covered / video_duration * 100
+        if cov < 3:
+            return f"字幕覆盖率仅 {cov:.1f}%（视频时长 {video_duration:.0f}s），几乎没有有效语音"
+    total_chars = sum(len(t) for t in nonempty)
+    if video_duration and video_duration > 120 and total_chars < video_duration / 60 * 2:
+        return (f"有效字符仅 {total_chars} 个，与视频时长 {video_duration / 60:.0f} 分钟严重不匹配，"
+                f"疑似静音/识别失败")
+    return None
+
+
 def _precheck_translation(translated) -> tuple:
     """翻译规则预检：返回 (是否直接失败, 问题列表, 失败扣分说明)。
 

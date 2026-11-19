@@ -1563,6 +1563,12 @@ class SmartQueue:
         self._running_tasks.add(task_id)
         try:
             cfg = db.get_all_settings()
+            # v1.1.15 快翻模式：一键关闭转录质检/翻译校对/润色，只保留「提取音频→转录→翻译」
+            if _flag(cfg, "fast_mode", False):
+                cfg = dict(cfg)
+                cfg["transcript_check_enabled"] = False
+                cfg["review_enabled"] = False
+                cfg["polish_enabled"] = False
             video_path = task["video_path"]
 
             # 一键润色任务：直接处理字幕文件，不参与视频流水线分流
@@ -1691,15 +1697,44 @@ class SmartQueue:
         from .pipeline.srt_utils import write_srt
         write_srt(segments, transcript_srt)
 
-        # 3) 转录质检
-        self._set_stage(task_id, "checking", 56)
-        check = quality_check.check_transcript(segments, duration, result["language"])
-        db.update_task_meta(task_id, transcript_score=check.score,
-                            transcribe_tokens_per_sec=round(result.get("tokens_per_sec", 0), 1),
-                            transcribe_time_s=round(result.get("elapsed", 0), 1),
-                            source_chars=result.get("chars", 0))
+        # 3) 转录废料拦截（强制生效：即使关闭转录质检或开启快翻，垃圾转录也不得进入翻译）
+        reject = quality_check.quick_guard(segments, duration)
+        if reject:
+            logger.warning("任务 %s 转录废料拦截: %s", task_id, reject)
+            archived = self._archive_review_failed(task_id, video_path, transcript_srt, "transcript")
+            db.create_subtitle(task_id, video_path, archived, "transcript",
+                               status="needs_review", lang=result["language"], score=0,
+                               report={"issues": [reject], "guard_rejected": True})
+            db.update_task_meta(task_id, transcript_score=0)
+            self._fail(task_id, f"转录无效已拦截：{reject}",
+                       suggestion=("转录字幕已归档到「质检未通过字幕目录」" if archived != transcript_srt
+                                   else "转录字幕已保存在视频同目录")
+                                  + "；该结果不会进入翻译。建议换用 large-v3 / large-v3-turbo 重新转录")
+            return
+
+        # 3) 转录质检（设置里可关闭；快翻时跳过，直接放行）
+        check_skipped = not _flag(cfg, "transcript_check_enabled", True)
+        if check_skipped:
+            logger.info("任务 %s 已关闭转录质检，直接放行", task_id)
+            from .models import QualityReport
+            check = QualityReport(passed=True, score=0, details={"skipped": True})
+            db.update_task_meta(task_id, transcript_score=0,
+                                transcribe_tokens_per_sec=round(result.get("tokens_per_sec", 0), 1),
+                                transcribe_time_s=round(result.get("elapsed", 0), 1),
+                                source_chars=result.get("chars", 0))
+        else:
+            self._set_stage(task_id, "checking", 56)
+            check = quality_check.check_transcript(segments, duration, result["language"])
+            db.update_task_meta(task_id, transcript_score=check.score,
+                                transcribe_tokens_per_sec=round(result.get("tokens_per_sec", 0), 1),
+                                transcribe_time_s=round(result.get("elapsed", 0), 1),
+                                source_chars=result.get("chars", 0))
         enhanced_flow = self._is_enhanced_flow(task_id)
-        if not check.passed:
+        if check_skipped:
+            db.create_subtitle(task_id, video_path, transcript_srt, "transcript",
+                               status="ok", lang=result["language"], score=0,
+                               report={"note": "转录质检已关闭（transcript_check_enabled=false），直接采用"})
+        elif not check.passed:
             logger.warning("转录质检未通过: %s", check.issues)
             if enhanced_flow:
                 # v1.1.0 增强流程放行：字幕留在视频同目录，不归档、不判失败，继续往下走
@@ -1814,10 +1849,44 @@ class SmartQueue:
         if self.mode() == "sync":
             from .pipeline.srt_utils import write_srt
             write_srt(segments, target_srt)
+            # v1.1.15：校对关闭 → 译文本就是最终产物，直接判定通过，整批继续推进到润色/完成
+            if not _flag(cfg, "review_enabled", True):
+                db.create_subtitle(task_id, video_path, target_srt, "translated",
+                                   status="ok", lang=cfg["target_lang"], score=0,
+                                   report={"note": "校对已关闭（review_enabled=false），译文本直接采用"})
+                if _flag(cfg, "polish_enabled", False):
+                    db.update_task(task_id, status=REVIEWED, stage="reviewed", progress=92,
+                                   error="校对已关闭，等待润色阶段")
+                    self._emit("task_reviewed", {"id": task_id, "status": REVIEWED})
+                else:
+                    db.update_task(task_id, status="done", stage="done", progress=100,
+                                   error="校对已关闭，翻译完成即交付")
+                    self._emit("task_done", {"id": task_id, "status": "done"})
+                transcribe.release_model()
+                return
             db.update_task(task_id, status=TRANSLATED, stage="translated", progress=88,
                            error="翻译完成，等待校对阶段")
             self._emit("task_translated", {"id": task_id, "status": TRANSLATED})
             transcribe.release_model()
+            return
+
+        # v1.1.15：校对关闭 → 翻译完直接落盘并视为通过（流水线/staged 模式）
+        if not _flag(cfg, "review_enabled", True):
+            from .pipeline.srt_utils import write_srt
+            write_srt(segments, target_srt)
+            db.create_subtitle(task_id, video_path, target_srt, "translated",
+                               status="ok", lang=cfg["target_lang"], score=0,
+                               report={"note": "校对已关闭（review_enabled=false），译文本直接采用"})
+            if _flag(cfg, "polish_enabled", False):
+                self._enter_model_group("review")
+                try:
+                    llm_manager.prepare_for("polish")
+                    self._polish_step(task_id, video_path, cfg, segments)
+                finally:
+                    self._exit_model_group("review")
+            db.update_task(task_id, status="done", stage="done", progress=100, error="")
+            self._emit("task_done", {"id": task_id, "status": "done"})
+            llm_manager.unload_all()
             return
 
         # 翻译校对（review 模型组：与翻译/asr 互斥）
@@ -1922,6 +1991,21 @@ class SmartQueue:
         if not _file_exists(target_srt):
             self._fail(task_id, "译文字幕不存在，无法校对",
                        suggestion="请重试该任务（重新翻译）")
+            return
+        # v1.1.15：校对关闭（含关闭前遗留的 translated 任务）→ 直接判通过，不再调用校对模型
+        if not _flag(cfg, "review_enabled", True):
+            db.create_subtitle(task_id, video_path, target_srt, "translated",
+                               status="ok", lang=cfg["target_lang"], score=0,
+                               report={"note": "校对已关闭（review_enabled=false），译文本直接采用"})
+            if not _flag(cfg, "polish_enabled", False):
+                db.update_task(task_id, status="done", stage="done", progress=100,
+                               error="校对已关闭，翻译完成即交付")
+                self._emit("task_done", {"id": task_id, "status": "done"})
+                llm_manager.unload_all()
+                return
+            db.update_task(task_id, status=REVIEWED, stage="reviewed", progress=96,
+                           error="校对已关闭，等待润色阶段")
+            self._emit("task_reviewed", {"id": task_id, "status": REVIEWED})
             return
         segments = self._load_translated_srt(task_id, video_path, target_srt)
         if not segments:
@@ -2028,17 +2112,24 @@ class SmartQueue:
         try:
             # 环节切换：卸载翻译模型（Sakura），让位给校对模型（review/llm 模型懒加载）
             llm_manager.prepare_for("polish")
-            review = quality_check.review_translation(segments, res.get("model_name", cfg["llm_model"]))
-            write_srt(segments, target_srt)
-            # 通过则不留质检建议，未通过才保留
-            db.create_subtitle(task_id, video_path, target_srt, "translated",
-                               status="ok" if review.passed else "needs_review",
-                               lang=cfg["target_lang"], score=review.score,
-                               report=({"passed": True} if review.passed else
-                                       {"issues": review.issues[:20],
-                                        "suggestions": review.suggestions[:10]}))
+            # v1.1.15：校对关闭 → 不调用校对模型，译文直接落盘并视为通过
+            if not _flag(cfg, "review_enabled", True):
+                write_srt(segments, target_srt)
+                db.create_subtitle(task_id, video_path, target_srt, "translated",
+                                   status="ok", lang=cfg["target_lang"], score=0,
+                                   report={"note": "校对已关闭（review_enabled=false），译文本直接采用"})
+            else:
+                review = quality_check.review_translation(segments, res.get("model_name", cfg["llm_model"]))
+                write_srt(segments, target_srt)
+                # 通过则不留质检建议，未通过才保留
+                db.create_subtitle(task_id, video_path, target_srt, "translated",
+                                   status="ok" if review.passed else "needs_review",
+                                   lang=cfg["target_lang"], score=review.score,
+                                   report=({"passed": True} if review.passed else
+                                           {"issues": review.issues[:20],
+                                            "suggestions": review.suggestions[:10]}))
             # v1.6.9: 润色作为流水线最后一步（仅对译文润色，不覆盖原翻译）
-            if cfg.get("polish_enabled", False):
+            if _flag(cfg, "polish_enabled", False):
                 self._polish_step(task_id, video_path, cfg, segments)
         finally:
             self._exit_model_group("review")
@@ -2090,17 +2181,35 @@ class SmartQueue:
         transcript_srt = str(Path(video_path).with_suffix(".transcript.srt"))
         write_srt(segments, transcript_srt)
 
-        # 3) 转录质检
-        self._set_stage(task_id, "checking", 56)
-        check = quality_check.check_transcript(segments, duration, result["language"])
-        db.update_task_meta(task_id, transcript_score=check.score,
-                            transcribe_tokens_per_sec=round(result.get("tokens_per_sec", 0), 1),
-                            transcribe_time_s=round(result.get("elapsed", 0), 1),
-                            source_chars=result.get("chars", 0))
-        db.create_subtitle(task_id, video_path, transcript_srt, "transcript",
-                           status="ok" if check.passed else "needs_review",
-                           lang=result["language"], score=check.score,
-                           report={"issues": check.issues[:20], "suggestions": check.suggestions[:10]})
+        # 3) 转录废料拦截（强制生效，不受质检开关/快翻影响）
+        reject = quality_check.quick_guard(segments, duration)
+        if reject:
+            logger.warning("任务 %s 转录废料拦截: %s", task_id, reject)
+            archived = self._archive_review_failed(task_id, video_path, transcript_srt, "transcript")
+            db.create_subtitle(task_id, video_path, archived, "transcript",
+                               status="needs_review", lang=result["language"], score=0,
+                               report={"issues": [reject], "guard_rejected": True})
+            self._fail(task_id, f"转录无效已拦截：{reject}",
+                       suggestion="转录字幕已归档/保留，不会进入后续环节；建议换用 large-v3 / large-v3-turbo 重新转录")
+            return
+
+        # 3) 转录质检（设置里可关闭）
+        if _flag(cfg, "transcript_check_enabled", True):
+            self._set_stage(task_id, "checking", 56)
+            check = quality_check.check_transcript(segments, duration, result["language"])
+            db.update_task_meta(task_id, transcript_score=check.score,
+                                transcribe_tokens_per_sec=round(result.get("tokens_per_sec", 0), 1),
+                                transcribe_time_s=round(result.get("elapsed", 0), 1),
+                                source_chars=result.get("chars", 0))
+            db.create_subtitle(task_id, video_path, transcript_srt, "transcript",
+                               status="ok" if check.passed else "needs_review",
+                               lang=result["language"], score=check.score,
+                               report={"issues": check.issues[:20], "suggestions": check.suggestions[:10]})
+        else:
+            logger.info("任务 %s 已关闭转录质检，直接放行", task_id)
+            db.create_subtitle(task_id, video_path, transcript_srt, "transcript",
+                               status="ok", lang=result["language"], score=0,
+                               report={"note": "转录质检已关闭（transcript_check_enabled=false），直接采用"})
         db.update_task(task_id, status="done", stage="done", progress=100, error="")
         self._emit("task_done", {"id": task_id, "status": "done"})
         llm_manager.unload_all()
@@ -2282,6 +2391,14 @@ def _overall(stage, inner_progress):
 def _file_exists(p):
     import os
     return os.path.exists(p)
+
+
+def _flag(cfg, key, default=True):
+    """读取布尔型设置：兼容 true/false、1/0 等字符串写法（设置表里历史上存过字符串）。"""
+    v = cfg.get(key, default)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v) if v is not None else default
 
 
 def _wav_path(video_path, task_id):

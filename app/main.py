@@ -19,6 +19,7 @@ from .queue_manager import smart_queue, enqueue_path
 from .scan_control import SCAN
 from .services import device_probe, metrics
 from .services.llm_client import get_client
+from .services.work_schedule import work_schedule, parse_windows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("subtitle-forge.main")
@@ -169,6 +170,10 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    try:
+        work_schedule.stop()
+    except Exception:
+        pass
     try:
         smart_queue.stop()
     except Exception as e:
@@ -632,6 +637,62 @@ async def api_queue_pause(body: QueuePauseBody):
     if not body.paused and body.force_unload:
         resp["repair"] = smart_queue.repair_state()
     return resp
+
+
+class WorkScheduleBody(BaseModel):
+    """工作时段调度配置（v1.1.16）。字段为 None 表示保持原值。"""
+    enabled: bool | None = None
+    windows: list | str | None = None   # ["22:00-08:00"] / "22:00-08:00,12:00-14:00" / 多行文本
+    work_minutes: int | None = None
+    rest_minutes: int | None = None
+    unload_on_rest: bool | None = None
+
+
+@app.get("/api/work_schedule")
+async def api_get_work_schedule():
+    """工作时段调度状态：当前处于运行/窗口外/周期休息/手动暂停，以及下次切换时刻。"""
+    return {"ok": True, **work_schedule.status()}
+
+
+@app.post("/api/work_schedule")
+async def api_set_work_schedule(body: WorkScheduleBody):
+    """更新工作时段配置，保存后立即按新配置决策一次（无需重启容器）。"""
+    changed = {}
+    if body.enabled is not None:
+        db.set_setting("work_schedule_enabled", bool(body.enabled))
+        changed["enabled"] = bool(body.enabled)
+    if body.windows is not None:
+        raw = body.windows
+        if isinstance(raw, (list, tuple)):
+            norm = []
+            for item in raw:
+                if isinstance(item, (list, tuple)) and len(item) == 2:
+                    norm.append(f"{str(item[0]).strip()}-{str(item[1]).strip()}")
+                else:
+                    norm.append(str(item).strip())
+            raw = norm
+            db.set_setting("work_schedule_windows", norm)
+        else:
+            text = (str(raw).replace("\n", ",").replace("；", ",")
+                    .replace("，", ",").replace(";", ",").strip())
+            norm = [x.strip() for x in text.split(",") if x.strip()]
+            db.set_setting("work_schedule_windows", norm)
+        changed["windows"] = [f"{s // 60:02d}:{s % 60:02d}-{e // 60:02d}:{e % 60:02d}"
+                              for s, e in parse_windows(norm)]
+    if body.work_minutes is not None:
+        v = max(0, min(24 * 60, int(body.work_minutes)))
+        db.set_setting("work_schedule_work_minutes", v)
+        changed["work_minutes"] = v
+    if body.rest_minutes is not None:
+        v = max(0, min(12 * 60, int(body.rest_minutes)))
+        db.set_setting("work_schedule_rest_minutes", v)
+        changed["rest_minutes"] = v
+    if body.unload_on_rest is not None:
+        db.set_setting("work_schedule_unload_on_rest", bool(body.unload_on_rest))
+        changed["unload_on_rest"] = bool(body.unload_on_rest)
+    snap = work_schedule.tick()
+    _broadcast("work_schedule", snap)
+    return {"ok": True, "changed": changed, "status": snap}
 
 
 class RepairBody(BaseModel):
