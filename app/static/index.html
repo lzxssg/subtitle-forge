@@ -38,9 +38,16 @@ h2 { font-size: 14px; font-weight: 600; color: var(--muted); letter-spacing: .5p
 .stat .k { font-size: 12px; color: var(--muted); }
 .stat .v { font-size: 26px; font-weight: 700; margin-top: 4px; line-height: 1.1; }
 .stat .s { font-size: 11px; color: var(--muted); margin-top: 2px; }
-.stat .hours { display: flex; gap: 1px; align-items: flex-end; height: 16px; margin-top: 6px; }
-.stat .hours i { flex: 1; display: block; background: var(--sc, var(--green)); opacity: .55; border-radius: 1px; min-height: 1px; }
-.stat .hours i:hover { opacity: 1; }
+.stat .hours { display: flex; gap: 1px; align-items: flex-end; height: 24px; margin-top: 6px; cursor: pointer; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+.stat .hours i { flex: 1 1 0; display: flex; align-items: flex-end; height: 100%; min-width: 2px; cursor: pointer; }
+.stat .hours i b { width: 100%; display: block; background: var(--sc, var(--green)); opacity: .55; border-radius: 1px; min-height: 2px; transition: opacity .15s; }
+.stat .hours i:hover b { opacity: 1; }
+.stat .hours i.sel b { opacity: 1; box-shadow: inset 0 0 0 1px rgba(255,255,255,.55); }
+.stat .hours.sel-on i:not(.sel) b { opacity: .18; }
+@media (max-width: 640px) { .stat .hours { height: 36px; gap: 2px; } }
+
+/* 选中/取消时的轻微反馈 */
+.stat.sel-active { border-color: var(--sc, var(--accent)); }
 
 /* ---------- 工作区卡片 ---------- */
 .section { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 20px; }
@@ -282,9 +289,9 @@ button.small.active { background: var(--accent); color: #fff; }
   <!-- 统计面板 -->
   <h2>任务统计</h2>
   <div class="stats-grid" id="statsGrid">
-    <div class="stat" style="--sc:var(--accent)"><div class="k">累计生成</div><div class="v" id="stTotal">-</div><div class="s">不含已取消</div></div>
+    <div class="stat" style="--sc:var(--cyan)"><div class="k">已完成</div><div class="v" id="stDone">-</div><div class="s" id="stDoneHint">近 14 天 每天完成数</div><div class="hours" id="stDoneHours"></div></div>
     <div class="stat" style="--sc:var(--green)"><div class="k">今日生成</div><div class="v" id="stTodayDone">-</div><div class="s" id="stTodayHint">今日 00:00–24:00 完成</div><div class="hours" id="stTodayHours"></div></div>
-    <div class="stat" style="--sc:var(--cyan)"><div class="k">已完成</div><div class="v" id="stDone">-</div><div class="s">生成成功</div></div>
+    <div class="stat" style="--sc:var(--accent)"><div class="k">累计生成</div><div class="v" id="stTotal">-</div><div class="s">不含已取消</div></div>
     <div class="stat" style="--sc:var(--yellow)"><div class="k">等待队列</div><div class="v" id="stWaiting">-</div><div class="s">批内各阶段待跑</div></div>
     <div class="stat" style="--sc:var(--muted);cursor:pointer" title="点击重新统计媒体库中已有字幕的视频数" onclick="refreshExistingStats(event)"><div class="k">已有字幕</div><div class="v" id="stSkipped">-</div><div class="s" id="stSkippedHint">扫描时自动跳过</div></div>
     <div class="stat" style="--sc:var(--red)"><div class="k">不支持</div><div class="v" id="stUnsupported">-</div><div class="s">格式/编码不支持</div></div>
@@ -732,19 +739,138 @@ async function loadStatus() {
     if (recP && $('polishWorkersHint')) $('polishWorkersHint').textContent = '当前智能推荐：' + recP.reason + '；需任务线程数 ≥ 并发数才生效。';
   } catch(e) { /* ignore */ }
 }
-function renderTodayHours(hourly) {
+const _todayHourly = { arr: new Array(24).fill(0), sel: -1 };
+function fmtHourRange(h) {
+  const a = String(h).padStart(2, '0');
+  const b = String((h + 1) % 24).padStart(2, '0');
+  return `${a}:00–${b}:00`;
+}
+function paintTodayHours() {
   const box = $('stTodayHours');
   if (!box) return;
-  const arr = Array.isArray(hourly) && hourly.length === 24 ? hourly : new Array(24).fill(0);
+  const arr = _todayHourly.arr;
   const max = Math.max(1, ...arr);
   box.innerHTML = arr.map((n, h) => {
-    const hh = String(h).padStart(2, '0');
     const pct = Math.max(6, Math.round(n / max * 100));
-    return `<i style="height:${pct}%" title="${hh}:00–${hh}:59 完成 ${n} 个"></i>`;
+    const cls = _todayHourly.sel === h ? ' class="sel"' : '';
+    return `<i data-h="${h}"${cls} title="${fmtHourRange(h)} 完成 ${n} 个"><b style="height:${pct}%"></b></i>`;
   }).join('');
-  const total = arr.reduce((a, b) => a + b, 0);
+  box.classList.toggle('sel-on', _todayHourly.sel >= 0);
+  if (box.parentElement) box.parentElement.classList.toggle('sel-active', _todayHourly.sel >= 0);
   const hEl = $('stTodayHint');
-  if (hEl) hEl.textContent = `00:00–24:00 完成 ${total} 个`;
+  if (!hEl) return;
+  if (_todayHourly.sel >= 0) {
+    const h = _todayHourly.sel;
+    hEl.textContent = `${fmtHourRange(h)} 完成 ${arr[h]} 个`;
+    hEl.style.color = 'var(--sc, var(--green))';
+    hEl.style.opacity = '.9';
+  } else {
+    const total = arr.reduce((a, b) => a + b, 0);
+    hEl.textContent = `00:00–24:00 完成 ${total} 个`;
+    hEl.style.color = '';
+    hEl.style.opacity = '';
+  }
+}
+function renderTodayHours(hourly) {
+  _todayHourly.arr = Array.isArray(hourly) && hourly.length === 24 ? hourly.slice() : new Array(24).fill(0);
+  if (_todayHourly.sel >= _todayHourly.arr.length) _todayHourly.sel = -1;
+  paintTodayHours();
+  const box = $('stTodayHours');
+  if (box && !box._boundClick) {
+    box._boundClick = true;
+    box.addEventListener('click', ev => {
+      const total = _todayHourly.arr.length || 24;
+      const rect = box.getBoundingClientRect();
+      let h = Math.floor((ev.clientX - rect.left) / (rect.width / total));
+      h = Math.max(0, Math.min(total - 1, h));
+      _todayHourly.sel = (_todayHourly.sel === h) ? -1 : h;
+      requestAnimationFrame(paintTodayHours);
+    });
+  }
+  const card = box && box.closest('.stat');
+  if (card && !card._boundClear) {
+    card._boundClear = true;
+    card.addEventListener('click', ev => {
+      const hb = card.querySelector('.hours');
+      if (hb) {
+        const r = hb.getBoundingClientRect();
+        if (ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom) return;
+      }
+      if (_todayHourly.sel >= 0) { _todayHourly.sel = -1; paintTodayHours(); }
+    });
+  }
+}
+
+// v1.1.17：已完成卡片——最近 14 天每天完成数（点柱子看某天数量，再点取消）
+const _doneDaily = { arr: [], sel: -1 };
+function paintDoneBars() {
+  const box = $('stDoneHours');
+  if (!box) return;
+  const arr = _doneDaily.arr;
+  const max = Math.max(1, ...arr.map(x => x.count || 0));
+  box.innerHTML = arr.map((it, i) => {
+    const pct = Math.max(6, Math.round((it.count || 0) / max * 100));
+    const cls = _doneDaily.sel === i ? ' class="sel"' : '';
+    return '<i data-h="' + i + '"' + cls + ' title="' + it.day + ' 完成 ' + it.count + ' 个"><b style="height:' + pct + '%"></b></i>';
+  }).join('');
+  box.classList.toggle('sel-on', _doneDaily.sel >= 0);
+  if (box.parentElement) box.parentElement.classList.toggle('sel-active', _doneDaily.sel >= 0);
+  const hEl = $('stDoneHint');
+  if (!hEl) return;
+  if (_doneDaily.sel >= 0 && arr[_doneDaily.sel]) {
+    const it = arr[_doneDaily.sel];
+    hEl.textContent = it.day + ' 完成 ' + it.count + ' 个';
+    hEl.style.color = 'var(--cyan)';
+    hEl.style.opacity = '.9';
+  } else {
+    const total = arr.reduce((a, b) => a + (b.count || 0), 0);
+    hEl.textContent = '近 ' + (arr.length || 14) + ' 天 完成 ' + total + ' 个';
+    hEl.style.color = '';
+    hEl.style.opacity = '';
+  }
+}
+function renderDoneBars(daily) {
+  _doneDaily.arr = Array.isArray(daily) ? daily.slice() : [];
+  if (_doneDaily.sel >= _doneDaily.arr.length) _doneDaily.sel = -1;
+  paintDoneBars();
+  const box = $('stDoneHours');
+  if (box && !box._boundClick) {
+    box._boundClick = true;
+    box.addEventListener('click', ev => {
+      const total = _doneDaily.arr.length || 14;
+      const rect = box.getBoundingClientRect();
+      let i = Math.floor((ev.clientX - rect.left) / (rect.width / total));
+      i = Math.max(0, Math.min(total - 1, i));
+      _doneDaily.sel = (_doneDaily.sel === i) ? -1 : i;
+      requestAnimationFrame(paintDoneBars);
+    });
+  }
+  const card = box && box.closest('.stat');
+  if (card && !card._boundClear) {
+    card._boundClear = true;
+    card.addEventListener('click', ev => {
+      const hb = card.querySelector('.hours');
+      if (hb) {
+        const r = hb.getBoundingClientRect();
+        if (ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom) return;
+      }
+      if (_doneDaily.sel >= 0) { _doneDaily.sel = -1; paintDoneBars(); }
+    });
+  }
+}
+
+
+// 点击卡片以外的任意区域，取消两张卡片的选中态
+if (!window._hoursClearBound) {
+  window._hoursClearBound = true;
+  document.addEventListener('click', ev => {
+    if (!ev.target || !ev.target.isConnected) return;
+    if (ev.target.closest && ev.target.closest('.stat')) return;
+    let changed = false;
+    if (_todayHourly.sel >= 0) { _todayHourly.sel = -1; paintTodayHours(); changed = true; }
+    if (_doneDaily.sel >= 0) { _doneDaily.sel = -1; paintDoneBars(); changed = true; }
+    if (changed) { /* 已重绘，回到总值显示 */ }
+  }, true);
 }
 
 async function refreshExistingStats(e) {
@@ -783,6 +909,7 @@ async function loadStats() {
       hint.textContent = ts ? ('统计于 ' + (ts.getMonth()+1) + '-' + ts.getDate() + ' ' + String(ts.getHours()).padStart(2,'0') + ':' + String(ts.getMinutes()).padStart(2,'0')) : '点击重新统计';
     }
     renderTodayHours(d.today_hourly || []);
+    renderDoneBars(d.done_daily || []);
     $('stUnsupported').textContent = d.unsupported ?? '-';
     $('stFailed').textContent = d.failed ?? '-';
   } catch(e) {}

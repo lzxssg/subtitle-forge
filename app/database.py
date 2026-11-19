@@ -436,6 +436,31 @@ def task_stats():
                 continue
             hourly[h] += 1
     out["today_hourly"] = hourly
+    # v1.1.17：已完成卡片——最近 14 天每天的完成数（按本地自然日分桶，末位为今天），
+    # 供首页「已完成」卡片柱状图与点击查看「某天完成多少个」使用
+    daily_days = 14
+    span_start = day_start - (daily_days - 1) * 86400
+    buckets = {}
+    with db() as conn:
+        for row in conn.execute(
+                "SELECT updated_at FROM tasks WHERE status='done' AND updated_at >= ?",
+                (span_start,)):
+            try:
+                t = time.localtime(float(row[0]))
+            except Exception:
+                continue
+            key = (t.tm_year, t.tm_mon, t.tm_mday)
+            buckets[key] = buckets.get(key, 0) + 1
+    done_daily = []
+    for i in range(daily_days):
+        t = time.localtime(span_start + i * 86400)
+        key = (t.tm_year, t.tm_mon, t.tm_mday)
+        done_daily.append({
+            "date": time.strftime("%Y-%m-%d", t),
+            "day": time.strftime("%m-%d", t),
+            "count": buckets.get(key, 0),
+        })
+    out["done_daily"] = done_daily
     out["day_start"] = int(day_start)
     return out
 
