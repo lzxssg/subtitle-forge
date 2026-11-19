@@ -1,5 +1,18 @@
 # 发布说明（GitHub 源码 + 容器镜像）
 
+### v1.1.16
+
+- 新增「工作时段调度」：每日运行窗口（支持跨夜与多段）+ 连续工作后强制休息 + 休息时卸载大模型
+- 新增 `GET/POST /api/work_schedule` 热更新接口，设置页「工作时段」Tab 保存即生效，无需重启
+- 只恢复调度器自己暂停的队列，手工「暂停队列」不会被自动放开；暂停期间任务保留断点
+- 新增环境变量 `WORK_SCHEDULE_ENABLED` / `WORK_SCHEDULE_WINDOWS` / `WORK_SCHEDULE_WORK_MINUTES` / `WORK_SCHEDULE_REST_MINUTES` / `WORK_SCHEDULE_UNLOAD_ON_REST`
+
+### v1.1.15
+
+- 新增 `fast_mode` 快翻总开关：关闭转录质检、翻译校对、润色，翻译完成即落盘交付
+- 新增 `transcript_check_enabled`、`review_enabled` 中间环节独立开关
+- 新增转录废料强制拦截 `quality_check.quick_guard`：空白、重复泛滥、占位文本、覆盖率近似 0 直接判失败归档
+
 ### v1.1.14
 
 - 任务列表状态标识中英混排修复：`STAGE_NAMES` 补 `translated:'待校对'`、`reviewed:'待润色'`
