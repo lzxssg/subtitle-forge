@@ -291,11 +291,12 @@ button.small.active { background: var(--accent); color: #fff; }
   <div class="stats-grid" id="statsGrid">
     <div class="stat" style="--sc:var(--cyan)"><div class="k">已完成</div><div class="v" id="stDone">-</div><div class="s" id="stDoneHint">近 14 天 每天完成数</div><div class="hours" id="stDoneHours"></div></div>
     <div class="stat" style="--sc:var(--green)"><div class="k">今日生成</div><div class="v" id="stTodayDone">-</div><div class="s" id="stTodayHint">今日 00:00–24:00 完成</div><div class="hours" id="stTodayHours"></div></div>
-    <div class="stat" style="--sc:var(--accent)"><div class="k">累计生成</div><div class="v" id="stTotal">-</div><div class="s">不含已取消</div></div>
-    <div class="stat" style="--sc:var(--yellow)"><div class="k">等待队列</div><div class="v" id="stWaiting">-</div><div class="s">批内各阶段待跑</div></div>
+    <div class="stat" style="--sc:var(--accent)"><div class="k">累计生成</div><div class="v" id="stTotal">-</div><div class="s" id="stTotalHint">不含已取消</div></div>
+    <div class="stat" style="--sc:var(--yellow);cursor:pointer" title="点击暂停队列：停止领取新任务，进行中任务挂起，断点保留" onclick="pauseQueueFromCard(event)"><div class="k">等待队列</div><div class="v" id="stWaiting">-</div><div class="s" id="stWaitingHint">批内各阶段待跑</div></div>
+    <div class="stat" style="--sc:var(--muted);cursor:pointer" title="点击恢复：被暂停的任务重新排队并从断点续跑" onclick="resumePausedTasks(event)"><div class="k">已暂停</div><div class="v" id="stPaused">-</div><div class="s" id="stPausedHint">点此恢复 = 断点续跑</div></div>
     <div class="stat" style="--sc:var(--muted);cursor:pointer" title="点击重新统计媒体库中已有字幕的视频数" onclick="refreshExistingStats(event)"><div class="k">已有字幕</div><div class="v" id="stSkipped">-</div><div class="s" id="stSkippedHint">扫描时自动跳过</div></div>
     <div class="stat" style="--sc:var(--red)"><div class="k">不支持</div><div class="v" id="stUnsupported">-</div><div class="s">格式/编码不支持</div></div>
-    <div class="stat" style="--sc:var(--red)"><div class="k">失败</div><div class="v" id="stFailed">-</div><div class="s">需要处理</div></div>
+    <div class="stat" style="--sc:var(--red);cursor:pointer" title="点击增强重试：忽略已有转录结果，用增强 ASR 模型重新转录全部失败任务" onclick="retryFailedFromCard(event)"><div class="k">失败</div><div class="v" id="stFailed">-</div><div class="s" id="stFailedHint">需要处理 · 点此增强重试</div></div>
   </div>
 
   <!-- 目录监控 -->
@@ -893,6 +894,52 @@ async function refreshExistingStats(e) {
   } catch (err) { loadStats(); }
 }
 
+// 已暂停卡：点击恢复（断点续跑）
+async function resumePausedTasks(ev) {
+  if (ev) ev.stopPropagation();
+  const n = (statsData && statsData.paused) || 0;
+  if (!n) { toast('当前没有处于暂停状态的任务。'); return; }
+  if (!confirm('恢复队列？\n将把 ' + n + ' 个暂停任务重新排队，并从断点续跑（已完成的环节不重复处理）。\n期间会占用显卡。')) return;
+  try {
+    const r = await fetch('/api/queue/pause', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paused: false, force_unload: true })
+    });
+    const d = await r.json();
+    toast('已恢复：放行 ' + (d.affected ?? n) + ' 个任务');
+  } catch (e) { toast('恢复失败：' + e); }
+  loadStats(); loadTasks && loadTasks();
+}
+
+// 等待队列卡：点击暂停
+async function pauseQueueFromCard(ev) {
+  if (ev) ev.stopPropagation();
+  const d = statsData || {};
+  const busy = (d.waiting ?? 0) + (d.running ?? 0);
+  if ((d.paused ?? 0) > 0) { toast('队列已处于暂停状态，点「已暂停」卡可恢复。'); return; }
+  if (!busy) { toast('当前没有等待或运行中的任务。'); return; }
+  if (!confirm('暂停队列？\n将停止领取新任务，并把 ' + busy + ' 个未完成任务挂起；已完成环节的断点产物保留，恢复后从断点续跑。\n正在运行的任务会在下一个进度点中断。')) return;
+  try {
+    const r = await fetch('/api/queue/pause', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paused: true })
+    });
+    const ret = await r.json();
+    toast('已暂停：挂起 ' + (ret.affected ?? busy) + ' 个任务');
+  } catch (e) { toast('暂停失败：' + e); }
+  loadStats(); loadTasks && loadTasks();
+}
+
+// 失败卡：点击增强重试
+async function retryFailedFromCard(ev) {
+  if (ev) ev.stopPropagation();
+  const n = (statsData && statsData.failed) || 0;
+  if (!n) { toast('当前没有失败任务。'); return; }
+  if (!confirm('增强重试 ' + n + ' 个失败任务？\n将忽略已有转录结果，用设置里的增强 ASR 模型重新转录，较耗显卡与时间。')) return;
+  await retryFailedAll(true);
+  loadStats();
+}
+
 async function loadStats() {
   try {
     const r = await fetch('/api/stats'); const d = await r.json();
@@ -902,6 +949,13 @@ async function loadStats() {
     $('stTodayDone').textContent = d.today_done ?? '-';
     $('stDone').textContent = d.done ?? '-';
     $('stWaiting').textContent = d.waiting ?? 0;
+    const wHint = $('stWaitingHint');
+    if (wHint) wHint.textContent = `批内待跑 · 运行中 ${d.running ?? 0}`;
+    const tHint = $('stTotalHint');
+    if (tHint) tHint.textContent = `不含已取消 ${d.cancelled ?? 0} · 暂停 ${d.paused ?? 0} 单列`;
+    $('stPaused').textContent = d.paused ?? 0;
+    const pHint = $('stPausedHint');
+    if (pHint) pHint.textContent = (d.paused ?? 0) > 0 ? '点此继续 = 重新排队' : '当前无暂停任务';
     $('stSkipped').textContent = d.scan_existing ?? d.skipped ?? '-';
     const hint = $('stSkippedHint');
     if (hint) {
@@ -912,6 +966,8 @@ async function loadStats() {
     renderDoneBars(d.done_daily || []);
     $('stUnsupported').textContent = d.unsupported ?? '-';
     $('stFailed').textContent = d.failed ?? '-';
+    const fHint = $('stFailedHint');
+    if (fHint) fHint.textContent = (d.failed ?? 0) > 0 ? '需要处理 · 点此增强重试' : '当前无失败任务';
   } catch(e) {}
 }
 

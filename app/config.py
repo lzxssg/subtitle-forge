@@ -16,7 +16,7 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # llama-swap 中注册的全部 LLM 模型（转录阶段全部卸载，把显存让给 ASR）
 DEFAULT_SWAP_MODELS = "sakura-gpu,qwen3_8b,review-35b,35B-A3B,glm4_9b"
 
-APP_VERSION = "1.1.17"
+APP_VERSION = "1.1.18"
 
 DEFAULTS = {
     "watch_dirs": os.getenv("WATCH_DIRS", "/Media"),

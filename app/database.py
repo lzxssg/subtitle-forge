@@ -389,19 +389,22 @@ def task_stats():
             " SUM(CASE WHEN status='translated' THEN 1 ELSE 0 END) AS waiting_translated,"
             " SUM(CASE WHEN status='reviewed' THEN 1 ELSE 0 END) AS waiting_reviewed,"
             " SUM(CASE WHEN status IN ('extracting','transcribing','checking','translating','checking_translation','polishing') THEN 1 ELSE 0 END) AS running,"
+            " SUM(CASE WHEN status='paused' THEN 1 ELSE 0 END) AS paused,"
             " SUM(CASE WHEN EXISTS (SELECT 1 FROM subtitles s WHERE s.task_id=tasks.id AND s.status='needs_review') THEN 1 ELSE 0 END) AS review"
             " FROM tasks", (day_start, day_end, day_start, day_end)).fetchone()
     keys = ("total", "today", "today_done", "active", "done",
             "failed", "cancelled", "unsupported", "waiting", "waiting_pending",
             "waiting_transcribed", "waiting_translated", "waiting_reviewed",
-            "running", "review")
+            "running", "review", "paused")
     # v1.1.13：聚合结果缺失字段时按 0 处理，避免 SQL 与 keys 不同步导致 /api/stats 直接 500
     _rk = set(r.keys())
     out = {k: (int(r[k] or 0) if k in _rk else 0) for k in keys}
     # v1.1.10：等待口径统一为库内状态（pending + transcribed），并给出自检差额，
     # 避免「等候中」用内存调度队列数而与「总任务数」等库内计数对不上。
+    # v1.1.18：暂停（paused）单列，避免成为「其他」黑洞导致
+    # 「已完成 + 等待」与「累计」对不上；等式：total = done + waiting + running + paused + failed + other
     out["other"] = max(0, out["total"] - out["waiting"] - out["running"]
-                       - out["done"] - out["failed"])
+                       - out["done"] - out["failed"] - out["paused"])
     # v1.1.8：「已有字幕」= 最近一次扫描发现已有字幕而跳过的视频数（任务表不会收录这些视频，
     # 原先用 stage='skipped' 统计恒为 0）；同时保留任务级跳过数作为补充。
     try:
